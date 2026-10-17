@@ -106,9 +106,12 @@ def build_snapshot(symbols: list[str], start: str, end: str, adjust: str = "qfq"
     parts: list[pd.DataFrame] = []
     cached_symbols: list[str] = []
     cached_metas: list[SnapshotMeta] = []
+    used_sources: dict[str, str] = {}  # 每个标的实际用到的数据源,写入 meta.notes 如实标注
     for sym in symbols:
         try:
-            parts.append(fetch_etf_daily(sym, start, end, adjust=adjust))
+            frame = fetch_etf_daily(sym, start, end, adjust=adjust)
+            used_sources[sym] = frame.attrs.get("source", source_name())
+            parts.append(frame)
         except Exception as err:
             if not allow_cache_fallback:
                 raise RuntimeError(f"标的 {sym} 取数失败(已禁用缓存回退): {err}") from err
@@ -116,6 +119,7 @@ def build_snapshot(symbols: list[str], start: str, end: str, adjust: str = "qfq"
             if hit is None:
                 raise RuntimeError(f"标的 {sym} 取数失败,且没有同口径缓存快照可回退: {err}") from err
             frame, cached_meta = hit
+            used_sources[sym] = cached_meta.source
             parts.append(frame)
             cached_symbols.append(sym)
             cached_metas.append(cached_meta)
@@ -139,12 +143,17 @@ def build_snapshot(symbols: list[str], start: str, end: str, adjust: str = "qfq"
     if cached_symbols:
         notes.append("缓存回退标的: " + ", ".join(sorted(cached_symbols))
                      + f"(来源快照 {', '.join(sorted({m.snapshot_id for m in cached_metas}))})")
+    # 数据源如实标注:全部来自同一源就写该源,混合时写主源+降级说明
+    distinct_sources = set(used_sources.values())
+    source = next(iter(distinct_sources)) if len(distinct_sources) == 1 else f"{source_name()}(+腾讯降级)"
+    if len(distinct_sources) > 1:
+        notes.append("各标的实际数据源: " + "; ".join(f"{s}: {used_sources[s]}" for s in symbols))
 
     meta = SnapshotMeta(
         snapshot_id=snapshot_id, symbols=symbols,
         start=_to_iso(start), end=_to_iso(end),
         actual_start=actual_start, actual_end=actual_end,
-        source=source_name(), fetched_at=fetched_at, adjust=adjust,
+        source=source, fetched_at=fetched_at, adjust=adjust,
         is_synthetic=False, from_cache=bool(cached_symbols),
         redistributable=None, notes=notes,
     )

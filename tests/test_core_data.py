@@ -12,6 +12,7 @@ import pandas as pd
 import pytest
 
 import core.data.snapshot as snap
+import core.data.sources as src
 from core.data.sources import fetch_etf_daily
 from core.data.universe import anomaly_limit, category_of, get_etf, get_universe
 from core.data.validate import validate_prices
@@ -169,6 +170,37 @@ def test_build_snapshot_cache_fallback(snap_dir, monkeypatch):
     prices, _, _ = snap.load_snapshot(meta2.snapshot_id)
     assert set(prices["symbol"]) == {"510300", "159915"}
     assert meta2.snapshot_id != meta.snapshot_id  # 数据不同,id 不同
+
+
+# ---------------------------------------------------------------- 数据源降级
+def test_fetch_falls_back_to_tencent(monkeypatch):
+    # 东财限流 → 自动降级腾讯源;成交量 股→手;来源写入 df.attrs
+    def em_boom(**kwargs):
+        raise RuntimeError("东财限流")
+
+    monkeypatch.setattr(src.ak, "fund_etf_hist_em", em_boom)
+    fake_tx = pd.DataFrame({
+        "date": ["2025-09-26", "2025-09-29"], "open": [4.55, 4.52],
+        "close": [4.528, 4.605], "high": [4.57, 4.63], "low": [4.52, 4.51],
+        "volume": [715305900, 800000000],
+    })
+    monkeypatch.setattr(src.ak, "stock_zh_a_hist_tx", lambda **kwargs: fake_tx)
+    df = src.fetch_etf_daily("510300", "2025-09-26", "2025-09-29")
+    assert list(df.columns) == PRICE_COLUMNS
+    assert df["volume"].iloc[0] == pytest.approx(7153059)  # 股 → 手
+    assert df.attrs["source"] == "akshare/stock_zh_a_hist_tx"
+
+
+def test_fetch_prefers_eastmoney_when_available(monkeypatch):
+    # 东财正常时直接用东财,不降级,不换算成交量
+    fake_em = pd.DataFrame({
+        "日期": ["2025-09-26"], "开盘": [4.55], "收盘": [4.528],
+        "最高": [4.57], "最低": [4.52], "成交量": [7153059],
+    })
+    monkeypatch.setattr(src.ak, "fund_etf_hist_em", lambda **kwargs: fake_em)
+    df = src.fetch_etf_daily("510300", "2025-09-26", "2025-09-26")
+    assert df.attrs["source"] == "akshare/fund_etf_hist_em"
+    assert df["volume"].iloc[0] == 7153059  # 东财本就是手,不换算
 
 
 # ---------------------------------------------------------------- 联网(默认跳过)
