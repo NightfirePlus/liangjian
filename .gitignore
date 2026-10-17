@@ -6,3 +6,5 @@ __pycache__/
 .claude/settings.local.json
 # 原始抓取缓存不入库；演示快照放 data/snapshots/，确认可分发后再提交
 data/raw/
+# 快照数据默认不提交(README:数据可否分发尚未核实,确认后再放开)
+data/snapshots/
