@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.env
+.venv/
+.pytest_cache/
+.claude/settings.local.json
+# 原始抓取缓存不入库；演示快照放 data/snapshots/，确认可分发后再提交
+data/raw/
