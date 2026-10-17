@@ -1,0 +1,26 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ssh -o ConnectTimeout=5 -T -p 443 git@ssh.github.com)",
+      "Bash(ssh-keygen -F github.com)",
+      "Read(//c/Users/Nightfire/.ssh/**)",
+      "Bash(cat >> *)",
+      "Bash(ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new -T git@github.com)",
+      "Bash(ssh-keygen -t ed25519 -C \"3240105765@zju.edu.cn\" -f ~/.ssh/id_ed25519 -N \"\")",
+      "Read(//d//**)",
+      "Read(//c/Users/Nightfire/**)",
+      "Bash(ssh -T git@github.com)",
+      "Bash(git commit -m ' *)",
+      "Bash(python -c \"import pandas, numpy; print\\('ok', pandas.__version__, numpy.__version__\\)\")",
+      "Bash(python -m pytest tests/test_backtest.py -v -s)",
+      "Bash(python -c ' *)",
+      "Bash(python -c \"from core.backtest.engine import run_backtest; from core.backtest import signals, metrics; print\\('imports ok'\\)\")",
+      "Bash(git rm *)",
+      "Bash(cat .gitignore)",
+      "Bash(ls -la .claude)"
+    ],
+    "additionalDirectories": [
+      "C:\\Users\\Nightfire\\.ssh"
+    ]
+  }
+}
