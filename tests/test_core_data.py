@@ -5,7 +5,9 @@
 """
 from __future__ import annotations
 
+import json
 import os
+from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
@@ -203,7 +205,76 @@ def test_fetch_prefers_eastmoney_when_available(monkeypatch):
     assert df["volume"].iloc[0] == 7153059  # 东财本就是手,不换算
 
 
-# ---------------------------------------------------------------- 联网(默认跳过)
+# ---------------------------------------------------------------- 缓存回收
+def _make_snapshot_files(snap_dir, snap_id, *, size=0, synthetic=False, fetched_days_ago=10):
+    """直接造一个快照目录(绕过取数),用于测试回收策略。"""
+    d = snap_dir / snap_id
+    d.mkdir(parents=True)
+    (d / "prices.csv").write_text("symbol,date,open,high,low,close,volume\n", encoding="utf-8")
+    (d / "meta.json").write_text(json.dumps({
+        "snapshot_id": snap_id, "symbols": ["510300"],
+        "start": "2025-01-01", "end": "2025-06-30",
+        "actual_start": "2025-01-02", "actual_end": "2025-06-30",
+        "source": "test", "adjust": "qfq", "is_synthetic": synthetic,
+        "from_cache": False, "redistributable": None, "notes": [],
+        "fetched_at": (datetime.now() - timedelta(days=fetched_days_ago)).isoformat(timespec="seconds"),
+    }), encoding="utf-8")
+    (d / "quality.json").write_text(json.dumps({"snapshot_id": snap_id, "issues": []}), encoding="utf-8")
+    if size:
+        (d / "big.bin").write_bytes(b"\0" * size)
+    return d
+
+
+def test_cache_under_limit_does_nothing(snap_dir):
+    _make_snapshot_files(snap_dir, "snap_a", fetched_days_ago=30)
+    assert snap.cache_size_bytes() > 0
+    result = snap.clean_snapshots(max_bytes=10**9, min_keep=1, dry_run=False)
+    assert result["evicted"] == 0
+    assert (snap_dir / "snap_a").exists()
+
+
+def test_clean_snapshots_evicts_oldest_idle(snap_dir):
+    old = _make_snapshot_files(snap_dir, "snap_old", size=1000, fetched_days_ago=30)
+    recent = _make_snapshot_files(snap_dir, "snap_recent", size=1000, fetched_days_ago=0)
+    result = snap.clean_snapshots(max_bytes=500, min_keep=1, dry_run=False)
+    assert result["evicted"] == 1
+    assert not old.exists() and recent.exists()
+
+
+def test_clean_snapshots_synthetic_evicted_first(snap_dir):
+    syn = _make_snapshot_files(snap_dir, "syn", size=1000, synthetic=True, fetched_days_ago=0)
+    real = _make_snapshot_files(snap_dir, "real", size=1000, fetched_days_ago=30)
+    result = snap.clean_snapshots(max_bytes=500, min_keep=1, dry_run=False)
+    assert not syn.exists() and real.exists()  # 模拟数据可零成本重建,优先删
+
+
+def test_clean_snapshots_pin_protection(snap_dir):
+    _make_snapshot_files(snap_dir, "pinned_snap", size=1000, fetched_days_ago=30)
+    _make_snapshot_files(snap_dir, "other", size=1000, fetched_days_ago=30)
+    snap.pin_snapshot("pinned_snap")
+    result = snap.clean_snapshots(max_bytes=500, min_keep=1, dry_run=False)
+    assert (snap_dir / "pinned_snap").exists()
+    assert not (snap_dir / "other").exists()
+    snap.unpin_snapshot("pinned_snap")
+    assert "pinned_snap" not in json.loads((snap_dir / "pins.json").read_text(encoding="utf-8"))
+
+
+def test_load_snapshot_updates_access_time(snap_dir):
+    _make_snapshot_files(snap_dir, "old_idle", size=1000, fetched_days_ago=30)
+    _make_snapshot_files(snap_dir, "used", size=1000, fetched_days_ago=30)
+    snap.load_snapshot("used")  # 刚访问过,应受闲置保护
+    result = snap.clean_snapshots(max_bytes=500, min_keep=1, dry_run=False)
+    assert (snap_dir / "used").exists()
+    assert not (snap_dir / "old_idle").exists()
+
+
+def test_clean_snapshots_dry_run_deletes_nothing(snap_dir):
+    _make_snapshot_files(snap_dir, "snap_x", size=1000, fetched_days_ago=30)
+    _make_snapshot_files(snap_dir, "snap_y", size=1000, fetched_days_ago=30)
+    result = snap.clean_snapshots(max_bytes=500, min_keep=1, dry_run=True)
+    assert result["evicted"] == 0
+    assert any(d["action"] == "would_evict" for d in result["details"])
+    assert (snap_dir / "snap_x").exists() and (snap_dir / "snap_y").exists()
 @pytest.mark.skipif(not LIVE, reason="RUN_LIVE=1 时联网跑真实取数")
 def test_live_fetch_etf_daily():
     df = fetch_etf_daily("510300", "2025-06-01", "2025-09-30")

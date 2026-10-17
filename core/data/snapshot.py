@@ -4,13 +4,19 @@
     data/snapshots/<snapshot_id>/prices.csv   长表,列为 PRICE_COLUMNS
     data/snapshots/<snapshot_id>/meta.json    SnapshotMeta
     data/snapshots/<snapshot_id>/quality.json QualityReport
+
+缓存容量管理(快照即缓存,只增不删会越积越多):
+    超过容量上限时自动回收,顺序为 模拟数据优先 → 最久未访问优先。
+    保护规则:总数 ≤ min_keep 不动;最近被 load_snapshot 访问过的不动;
+    pins.json 标记保留的不动;回收明细写入 .eviction_log.jsonl,不静默。
 """
 from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 from dataclasses import asdict
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -26,6 +32,15 @@ _VOLUME_UNIT_NOTE = "成交量单位为手(每手 100 份)"
 # 缓存覆盖判断的容差:请求区间起点可能落在周末/长假,
 # 数据源返回的是首个实际交易日,最长假期约 10 个自然日
 _COVER_TOLERANCE_DAYS = 10
+
+# ---------------------------------------------------------------- 容量管理
+# ETF 日线单标的约 50KB/年,500MB 约合数千个快照,阈值设得宽松
+_CACHE_DEFAULT_MAX_BYTES = 500 * 1024 * 1024
+_CACHE_DEFAULT_MIN_IDLE_DAYS = 7   # 最近 7 天内被访问过的快照不回收
+_CACHE_DEFAULT_MIN_KEEP = 3        # 快照总数低于此值时不动
+_PINS_FILE = "pins.json"
+_ACCESS_FILE = ".accessed_at"
+_EVICT_LOG_FILE = ".eviction_log.jsonl"
 
 
 def _now() -> str:
@@ -63,6 +78,150 @@ def _read_meta(snapshot_dir: Path) -> SnapshotMeta | None:
         return None
 
 
+def _snapshot_dirs() -> list[Path]:
+    """快照目录列表(排除 .开头 的管理文件)。"""
+    if not SNAPSHOT_DIR.exists():
+        return []
+    return [p for p in SNAPSHOT_DIR.iterdir() if p.is_dir() and not p.name.startswith(".")]
+
+
+def _touch_access(snapshot_dir: Path) -> None:
+    """记录访问时间(load/构建/回退命中时调用),供回收时的"最久未访问"排序用。"""
+    (snapshot_dir / _ACCESS_FILE).write_text(_now(), encoding="utf-8")
+
+
+def _last_access(snapshot_dir: Path, meta: SnapshotMeta) -> datetime:
+    """最近访问时间;没有访问记录时退回快照生成时间。"""
+    access_file = snapshot_dir / _ACCESS_FILE
+    if access_file.exists():
+        try:
+            return datetime.fromisoformat(access_file.read_text(encoding="utf-8").strip())
+        except ValueError:
+            pass
+    return datetime.fromisoformat(meta.fetched_at)
+
+
+def cache_size_bytes() -> int:
+    """数据快照目录当前占用字节数。"""
+    total = 0
+    for d in _snapshot_dirs():
+        for f in d.iterdir():
+            if f.is_file():
+                total += f.stat().st_size
+    return total
+
+
+def _read_pins() -> set[str]:
+    pins_file = SNAPSHOT_DIR / _PINS_FILE
+    if not pins_file.exists():
+        return set()
+    try:
+        return set(json.loads(pins_file.read_text(encoding="utf-8")))
+    except Exception:
+        return set()
+
+
+def _write_pins(pins: set[str]) -> None:
+    SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+    (SNAPSHOT_DIR / _PINS_FILE).write_text(
+        json.dumps(sorted(pins), ensure_ascii=False, indent=2), encoding="utf-8", newline="\n")
+
+
+def pin_snapshot(snapshot_id: str) -> None:
+    """标记快照为"保留",自动清理永不回收(如:想长期留存的实验数据)。"""
+    pins = _read_pins()
+    pins.add(snapshot_id)
+    _write_pins(pins)
+
+
+def unpin_snapshot(snapshot_id: str) -> None:
+    pins = _read_pins()
+    pins.discard(snapshot_id)
+    _write_pins(pins)
+
+
+def _log_eviction(details: list[dict], dry_run: bool) -> None:
+    """回收明细写日志(追加一行 JSON),删了什么、为什么删全部可查。"""
+    if not details:
+        return
+    SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+    line = json.dumps({"at": _now(), "dry_run": dry_run, "details": details}, ensure_ascii=False)
+    with open(SNAPSHOT_DIR / _EVICT_LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(line + "\n")
+
+
+def clean_snapshots(max_bytes: int = _CACHE_DEFAULT_MAX_BYTES,
+                    min_idle_days: float = _CACHE_DEFAULT_MIN_IDLE_DAYS,
+                    min_keep: int = _CACHE_DEFAULT_MIN_KEEP,
+                    dry_run: bool = True) -> dict:
+    """缓存回收:占用超过 max_bytes 时,按"模拟数据优先 → 最久未访问优先"释放。
+
+    保护规则(满足其一就不回收):
+    - 快照总数 ≤ min_keep;
+    - 真实数据且最近 min_idle_days 天内被 load_snapshot 读过或刚生成;
+    - 在 pins.json 里标记保留(pin_snapshot)。
+
+    dry_run=True 只返回方案不真删(默认)。回收明细同时追加到
+    data/snapshots/.eviction_log.jsonl。返回 {evicted, freed_bytes, remaining_bytes, details}。
+    """
+    dirs = _snapshot_dirs()
+    if len(dirs) <= min_keep:
+        return {"evicted": 0, "freed_bytes": 0, "remaining_bytes": cache_size_bytes(), "details": []}
+
+    total = cache_size_bytes()
+    if total <= max_bytes:
+        return {"evicted": 0, "freed_bytes": 0, "remaining_bytes": total, "details": []}
+
+    pins = _read_pins()
+    now = datetime.now()
+    idle_limit = timedelta(days=min_idle_days)
+
+    entries = []
+    for d in dirs:
+        meta = _read_meta(d)
+        if meta is not None:
+            entries.append((d, meta, _last_access(d, meta)))
+    # 模拟数据排最前(可零成本重建,且豁免闲置保护),其余按最久未访问排序
+    entries.sort(key=lambda t: (not t[1].is_synthetic, t[2]))
+
+    budget = len(dirs) - min_keep
+    details: list[dict] = []
+    # planned/freed 分开:预演模式下 planned 和 remaining 也要推进,才能算出完整方案
+    planned, freed = 0, 0
+    remaining = total
+    for d, meta, last_access in entries:
+        if planned >= budget or remaining <= max_bytes:
+            break
+        if meta.snapshot_id in pins:
+            details.append({"snapshot_id": meta.snapshot_id, "action": "kept", "reason": "pinned"})
+            continue
+        if not meta.is_synthetic and now - last_access < idle_limit:
+            details.append({"snapshot_id": meta.snapshot_id, "action": "kept", "reason": "recently_accessed"})
+            continue
+        size = sum(f.stat().st_size for f in d.iterdir() if f.is_file())
+        details.append({"snapshot_id": meta.snapshot_id,
+                        "action": "evict" if not dry_run else "would_evict",
+                        "reason": "synthetic" if meta.is_synthetic else "idle",
+                        "freed_bytes": size})
+        planned += 1
+        remaining -= size
+        if not dry_run:
+            shutil.rmtree(d)
+            freed += size
+
+    _log_eviction(details, dry_run)
+    return {"evicted": 0 if dry_run else planned, "freed_bytes": freed,
+            "remaining_bytes": total - freed, "details": details}
+
+
+def _maybe_evict() -> dict:
+    """建快照后自动检查容量,超限按默认策略回收(保护规则兜底,明细写日志)。"""
+    try:
+        return clean_snapshots(dry_run=False)
+    except Exception:
+        return {"evicted": 0, "freed_bytes": 0, "remaining_bytes": cache_size_bytes(), "details": []}
+
+
 def _find_cached_prices(symbol: str, start: str, end: str,
                         adjust: str) -> tuple[pd.DataFrame, SnapshotMeta] | None:
     """在已有非模拟、同复权口径的快照里找覆盖 [start, end] 的该标的,取最新一个。
@@ -88,6 +247,7 @@ def _find_cached_prices(symbol: str, start: str, end: str,
         if best is None or meta.fetched_at > best[1].fetched_at:
             window = part[(part["date"] >= start_ts) & (part["date"] <= end_ts)]
             best = (window, meta)
+            _touch_access(meta_file.parent)  # 缓存回退命中 = 访问,参与回收时的闲置排序
     return best
 
 
@@ -163,6 +323,8 @@ def build_snapshot(symbols: list[str], start: str, end: str, adjust: str = "qfq"
     cleaned.to_csv(out_dir / "prices.csv", index=False, lineterminator="\n")
     _write_json(out_dir / "meta.json", asdict(meta))
     _write_json(out_dir / "quality.json", asdict(report))
+    _touch_access(out_dir)
+    _maybe_evict()  # 超限自动回收,保护规则兜底
     return meta, report
 
 
@@ -171,6 +333,7 @@ def load_snapshot(snapshot_id: str) -> tuple[pd.DataFrame, SnapshotMeta, Quality
     out_dir = SNAPSHOT_DIR / snapshot_id
     if not out_dir.exists():
         raise FileNotFoundError(f"快照不存在: {snapshot_id}({out_dir})")
+    _touch_access(out_dir)  # 读取 = 访问,写访问时间供回收排序
     prices = pd.read_csv(out_dir / "prices.csv", parse_dates=["date"], dtype={"symbol": str})
     meta_data = json.loads((out_dir / "meta.json").read_text(encoding="utf-8"))
     quality_data = json.loads((out_dir / "quality.json").read_text(encoding="utf-8"))
@@ -238,4 +401,5 @@ def make_synthetic_snapshot(symbols: list[str], start: str, end: str, seed: int 
     prices.to_csv(out_dir / "prices.csv", index=False, lineterminator="\n")
     _write_json(out_dir / "meta.json", asdict(meta))
     _write_json(out_dir / "quality.json", asdict(QualityReport(snapshot_id=snapshot_id)))
+    _touch_access(out_dir)
     return meta
