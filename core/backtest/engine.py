@@ -15,10 +15,28 @@ def run_backtest(prices: pd.DataFrame, config: StrategyConfig,
 
     返回 (trades, daily, metrics)。
     """
-    symbol_prices = prices[prices["symbol"] == config.symbols[0]]
+    if not config.symbols:
+        raise ValueError("config.symbols 不能为空")
+
+    start = pd.Timestamp(config.start)
+    end = pd.Timestamp(config.end)
+    if start > end:
+        raise ValueError(f"开始日期不能晚于结束日期: {config.start} > {config.end}")
+
+    in_period = prices["date"].between(start, end, inclusive="both")
+    symbol_prices = prices[in_period & (prices["symbol"] == config.symbols[0])]
+    if symbol_prices.empty:
+        raise ValueError(
+            f"标的 {config.symbols[0]} 在区间 {config.start} ~ {config.end} 内没有行情"
+        )
+
+    period_benchmark = None
+    if benchmark_prices is not None:
+        bench_in_period = benchmark_prices["date"].between(start, end, inclusive="both")
+        period_benchmark = benchmark_prices[bench_in_period]
 
     if config.template == "ma_cross":
-        trades, daily = run_ma_cross(symbol_prices, config, benchmark_prices)
+        trades, daily = run_ma_cross(symbol_prices, config, period_benchmark)
     elif config.template == "momentum_rotation":
         raise NotImplementedError("动量轮动模板尚未实现")
     else:

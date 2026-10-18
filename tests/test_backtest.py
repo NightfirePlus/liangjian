@@ -6,7 +6,7 @@ import pandas as pd
 
 from core.backtest.engine import run_backtest, run_backtest_from_snapshot
 from core.data import make_synthetic_snapshot
-from core.schemas import StrategyConfig
+from core.schemas import CostConfig, StrategyConfig
 
 
 def make_synthetic_prices(symbol: str, start: str, end: str, seed: int = 0) -> pd.DataFrame:
@@ -95,6 +95,47 @@ def test_run_backtest_from_snapshot():
     assert not daily.empty
     assert (daily["symbol"] == "__TOTAL__").any()
     assert metrics.n_trades == len(trades)
+
+
+def test_backtest_respects_config_date_range():
+    prices = make_synthetic_prices("510300", "2023-01-01", "2024-12-31", seed=4)
+    config = StrategyConfig(
+        template="ma_cross", symbols=["510300"],
+        start="2024-01-01", end="2024-12-31", params={"fast": 5, "slow": 20},
+    )
+
+    _, daily, _ = run_backtest(prices, config)
+    total = daily[daily["symbol"] == "__TOTAL__"]
+
+    assert total["date"].min() >= pd.Timestamp("2024-01-01")
+    assert total["date"].max() <= pd.Timestamp("2024-12-31")
+    assert len(total) == len(pd.bdate_range("2024-01-01", "2024-12-31"))
+
+
+def test_min_commission_never_makes_cash_negative():
+    prices = make_synthetic_prices("510300", "2023-01-01", "2024-12-31", seed=5)
+    config = StrategyConfig(
+        template="ma_cross", symbols=["510300"],
+        start="2023-01-01", end="2024-12-31", params={"fast": 5, "slow": 20},
+        cost=CostConfig(commission_rate=0.0001, min_commission=1_000, slippage_bps=1),
+    )
+
+    _, daily, _ = run_backtest(prices, config)
+    total = daily[daily["symbol"] == "__TOTAL__"]
+
+    assert total["cash"].min() >= -1e-8
+
+
+def test_invalid_ma_parameters_are_rejected():
+    prices = make_synthetic_prices("510300", "2024-01-01", "2024-12-31", seed=6)
+    config = StrategyConfig(
+        template="ma_cross", symbols=["510300"],
+        start="2024-01-01", end="2024-12-31", params={"fast": 20, "slow": 5},
+    )
+
+    import pytest
+    with pytest.raises(ValueError, match="快线周期必须小于慢线周期"):
+        run_backtest(prices, config)
 
 
 if __name__ == "__main__":

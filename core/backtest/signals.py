@@ -20,6 +20,10 @@ def run_ma_cross(prices: pd.DataFrame, config: StrategyConfig,
     """
     fast = int(config.params.get("fast", 5))
     slow = int(config.params.get("slow", 20))
+    if fast <= 0 or slow <= 0:
+        raise ValueError(f"均线参数必须为正整数: fast={fast}, slow={slow}")
+    if fast >= slow:
+        raise ValueError(f"快线周期必须小于慢线周期: fast={fast}, slow={slow}")
     symbol = config.symbols[0]
     cost = config.cost
 
@@ -61,17 +65,18 @@ def run_ma_cross(prices: pd.DataFrame, config: StrategyConfig,
                 exec_price = row["open"]
                 gross = cash
                 shares = _apply_buy_cost(gross, exec_price, cost)
-                commission, slippage_cost = _buy_costs(shares, exec_price, cost)
-                spent = shares * exec_price + commission + slippage_cost
-                cash -= spent
-                position_open = True
-                trade_id += 1
-                trades.append({
-                    "trade_id": trade_id, "signal_date": signal_row["date"], "exec_date": date,
-                    "symbol": symbol, "side": "buy", "shares": shares, "price": exec_price,
-                    "gross": shares * exec_price, "commission": commission,
-                    "slippage_cost": slippage_cost, "rule_trigger": f"ma{fast}_cross_up_ma{slow}",
-                })
+                if shares > 0:
+                    commission, slippage_cost = _buy_costs(shares, exec_price, cost)
+                    spent = shares * exec_price + commission + slippage_cost
+                    cash -= spent
+                    position_open = True
+                    trade_id += 1
+                    trades.append({
+                        "trade_id": trade_id, "signal_date": signal_row["date"], "exec_date": date,
+                        "symbol": symbol, "side": "buy", "shares": shares, "price": exec_price,
+                        "gross": shares * exec_price, "commission": commission,
+                        "slippage_cost": slippage_cost, "rule_trigger": f"ma{fast}_cross_up_ma{slow}",
+                    })
             elif pending_signal == "sell" and position_open:
                 exec_price = row["open"]
                 gross = shares * exec_price
@@ -128,7 +133,23 @@ def _sell_costs(shares: float, price: float, cost: CostConfig) -> tuple[float, f
 
 def _apply_buy_cost(cash: float, price: float, cost: CostConfig) -> float:
     """用全部现金满仓买入时，倒推在扣除佣金和滑点后能买到的股数。"""
-    denom = price * (1 + cost.commission_rate + cost.slippage_bps / 10_000)
-    if denom <= 0:
+    if cash <= 0 or price <= 0:
         return 0.0
-    return cash / denom
+
+    commission_rate = max(float(cost.commission_rate), 0.0)
+    min_commission = max(float(cost.min_commission), 0.0)
+    slippage_rate = max(float(cost.slippage_bps), 0.0) / 10_000
+
+    # 总支出 = gross + max(gross * commission_rate, min_commission)
+    #          + gross * slippage_rate。按最低佣金与比例佣金的分界点分段求解。
+    if commission_rate > 0:
+        threshold_gross = min_commission / commission_rate
+        threshold_cash = threshold_gross * (1 + commission_rate + slippage_rate)
+    else:
+        threshold_cash = float("inf")
+
+    if cash >= threshold_cash:
+        gross = cash / (1 + commission_rate + slippage_rate)
+    else:
+        gross = max(cash - min_commission, 0.0) / (1 + slippage_rate)
+    return gross / price
