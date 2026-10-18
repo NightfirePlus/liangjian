@@ -122,7 +122,7 @@ def _build_experiment_spec(candidate: dict) -> ExperimentSpec | None:
         experiment_id="",
         kind=kind,
         claim_text=claim_text,
-        metric="net_excess_return",
+        metric="excess_return",
         grid={},
         support_rule="",
     )

@@ -173,6 +173,7 @@ def test_parser_end_to_end_with_override_and_claim(monkeypatch):
     assert result.experiment_spec is not None
     assert result.experiment_spec.kind == "cost_sweep"
     assert result.experiment_spec.claim_text == "我认为这个策略对交易成本不敏感"
+    assert result.experiment_spec.metric == "excess_return"
     assert result.experiment_spec.grid == {}
     assert result.experiment_spec.support_rule == ""
 

@@ -7,10 +7,12 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from config import APP_NAME, APP_TAGLINE, DISCLAIMER, LLM_AVAILABLE
+from config import APP_NAME, APP_TAGLINE, APP_VERSION, DISCLAIMER, LLM_AVAILABLE
 from core.backtest.engine import run_backtest_from_snapshot
 from core.data import get_etf, list_snapshots, load_snapshot
-from core.schemas import CostConfig, Metrics, StrategyConfig
+from core.experiments import run_validation_suite
+from core.report import build_evidence, chart_for, generate_report, export_bundle
+from core.schemas import CostConfig, Metrics, StrategyConfig, ValidationReport
 
 st.set_page_config(page_title=APP_NAME, page_icon="📈", layout="wide")
 
@@ -63,12 +65,53 @@ def _render_curve(daily: pd.DataFrame) -> None:
     st.plotly_chart(fig, width="stretch")
 
 
+def _render_validation_report(report: ValidationReport) -> None:
+    baseline = report.baseline
+    st.subheader("原始策略基准")
+    baseline_cols = st.columns(4)
+    baseline_cols[0].metric("策略收益", _percent(baseline.get("total_return")))
+    baseline_cols[1].metric("基准收益", _percent(baseline.get("benchmark_return")))
+    baseline_cols[2].metric("超额收益", _percent(baseline.get("excess_return")))
+    baseline_cols[3].metric("成交笔数", str(baseline.get("n_trades", 0)))
+
+    sections = [
+        (
+            "cost_sensitivity",
+            "成本敏感性（本版改变滑点）",
+            ["slippage_bps", "is_baseline", "total_return", "excess_return", "total_cost", "n_trades", "error"],
+        ),
+        (
+            "strategy_parameter_robustness",
+            "策略参数稳健性（改变用户策略参数）",
+            ["fast", "slow", "is_baseline", "total_return", "excess_return", "n_trades", "error"],
+        ),
+        (
+            "market_period_robustness",
+            "市场时段稳健性（保持策略，改变真实数据区间）",
+            ["period", "start", "end", "total_return", "excess_return", "n_trades", "error"],
+        ),
+    ]
+    for key, title, columns in sections:
+        result = report.experiments[key]
+        with st.expander(title, expanded=True):
+            st.caption(
+                f"共 {result.total_points} 个实验点，"
+                f"其中 {result.passed_points} 个超额收益为正；不代表策略有效性的判定。"
+            )
+            frame = pd.DataFrame(result.rows)
+            visible_columns = [column for column in columns if column in frame.columns]
+            st.dataframe(frame[visible_columns], width="stretch", hide_index=True)
+
+    st.caption(f"验证编号：{report.validation_id} · 配置哈希：{report.config_hash}")
+
+
 st.title(APP_NAME)
 st.caption(APP_TAGLINE)
+st.caption(f"测试版 {APP_VERSION}")
 st.warning(DISCLAIMER)
 
 if not LLM_AVAILABLE:
-    st.info("自然语言解析和 AI 解释尚未接入。当前可通过手动配置运行完整回测。")
+    st.info("模型尚未配置。可以运行回测、验证实验，并查看图表与事实报告。")
 
 st.header("1. 选择数据快照")
 snapshots = list_snapshots()
@@ -259,7 +302,78 @@ elif stored:
     )
 
 st.header("4. 验证实验")
-st.caption("成本敏感性、参数邻域和分时段实验完成后，将复用上面的已确认策略配置。")
+st.caption(
+    "先复核原始策略，再分别改变交易成本、策略参数和真实市场时段。"
+    "时事归因已预留结果接口，本版不参与结论。"
+)
+if not stored or stored["key"] != result_key:
+    st.info("请先用当前配置运行基准回测，再运行验证实验。")
+else:
+    st.write(
+        "验证实验会使用同一份行情快照；参数实验只改变快慢线，"
+        "时段实验保持原策略参数不变。"
+    )
+    if benchmark_symbol is None:
+        st.caption("验证实验将使用交易标的的买入持有作为比较基准。")
+    validation_clicked = st.button("运行完整验证实验", type="secondary")
+    if validation_clicked:
+        try:
+            with st.spinner("正在运行基准、成本、参数和市场时段验证……"):
+                validation_report = run_validation_suite(
+                    stored["config"],
+                    benchmark_symbol=benchmark_symbol or symbol,
+                )
+            st.session_state["validation_result"] = {
+                "key": result_key,
+                "report": validation_report,
+            }
+            pack = build_evidence(validation_report)
+            factual = generate_report(pack)
+            st.session_state["evidence_result"] = {
+                "key": result_key, "pack": pack, "analysis": factual,
+                "bundle": export_bundle(pack, factual),
+            }
+        except Exception as error:
+            st.exception(error)
+
+    validation_stored = st.session_state.get("validation_result")
+    if validation_stored and validation_stored["key"] == result_key:
+        _render_validation_report(validation_stored["report"])
 
 st.header("5. 证据报告")
-st.caption("报告模块完成后，这里将展示程序诊断、实验结论及其证据引用。")
+evidence_stored = st.session_state.get("evidence_result")
+if evidence_stored and evidence_stored["key"] == result_key:
+    pack = evidence_stored["pack"]
+    context = pack["entries"][f"{pack['run_id']}:context"]["data"]
+    if context.get("snapshot", {}).get("is_synthetic"):
+        st.warning("本报告使用模拟数据，仅用于流程演示。")
+    with st.expander("实验范围与限制"):
+        for limitation in context.get("limitations", []):
+            st.write(limitation)
+    if st.button("生成 AI 分析", disabled=not LLM_AVAILABLE):
+        with st.spinner("正在结合实验数据与证据生成分析……"):
+            analysis = generate_report(pack, use_llm=True)
+            evidence_stored["analysis"] = analysis
+            evidence_stored["bundle"] = export_bundle(pack, analysis)
+    analysis = evidence_stored["analysis"]
+    st.info(analysis["notice"])
+    for index, finding in enumerate(analysis["findings"]):
+        st.subheader(finding["title"])
+        st.caption("实验事实" if finding["level"] == "fact" else "AI 分析")
+        st.write(finding["statement"])
+        for limitation in finding["limitations"]:
+            st.caption(limitation)
+        for eid in finding["evidence_refs"]:
+            entry = pack["entries"][eid]
+            with st.expander("证据附件：" + entry["title"], expanded=entry["kind"] == "chart"):
+                st.caption(eid)
+                if entry["kind"] == "chart":
+                    st.plotly_chart(chart_for(pack, eid), width="stretch", key=f"evidence_{index}_{eid}")
+                elif entry["kind"] == "table":
+                    st.dataframe(pd.DataFrame(entry["data"]), width="stretch", hide_index=True)
+                else:
+                    st.json(entry["data"])
+    st.download_button("下载报告与证据附件 ZIP", data=evidence_stored["bundle"],
+                       file_name=f"{pack['run_id']}.zip", mime="application/zip")
+else:
+    st.caption("运行验证实验后，将生成图表、事实摘要和可下载的证据附件。")

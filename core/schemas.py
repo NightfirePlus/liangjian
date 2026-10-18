@@ -119,7 +119,7 @@ class ExperimentSpec:
     experiment_id: str
     kind: Literal["cost_sweep", "param_neighborhood", "period_split"]
     claim_text: str                   # 用户原话，如"交易成本影响小"
-    metric: str                       # 如 "net_excess_return"
+    metric: str                       # Metrics 字段名，如 "excess_return"
     grid: dict                        # 预先固定的扫描范围，如 {"slippage_bps":[0,1,2,5,10]}
     support_rule: str                 # 判断条件，如 "各档位 excess_return > 0"
     confirmed_by_user: bool = False
@@ -132,6 +132,27 @@ class ExperimentResult:
     verdict: Literal["supported", "not_supported", "mixed", "insufficient"]
     first_failure: dict | None = None  # 已测档位中首个不满足判断条件的点；不是全局边界
     config_hash: str = ""
+    passed_points: int = 0
+    total_points: int = 0
+    pass_rate: float | None = None
+    rule_satisfied: bool | None = None
+
+
+@dataclass
+class ValidationReport:
+    """原策略、策略扰动和市场区间扰动组成的一次完整验证。"""
+
+    validation_id: str
+    baseline: dict
+    experiments: dict[str, ExperimentResult]
+    verdict: str | None = None  # 兼容旧调用；完整实验不再自动形成报告结论
+    reasons: list[str] = field(default_factory=list)
+    config_hash: str = ""
+    # 为后续时事归因保留稳定输出位置；v1 不参与任何实验结论。
+    event_analysis: dict | None = None
+    context: dict = field(default_factory=dict)
+    baseline_daily: list[dict] = field(default_factory=list)
+    baseline_trades: list[dict] = field(default_factory=list)
 
 
 @dataclass
