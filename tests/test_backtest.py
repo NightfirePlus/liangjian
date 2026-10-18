@@ -4,7 +4,8 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from core.backtest.engine import run_backtest
+from core.backtest.engine import run_backtest, run_backtest_from_snapshot
+from core.data import make_synthetic_snapshot
 from core.schemas import StrategyConfig
 
 
@@ -76,8 +77,29 @@ def test_no_trades_when_no_cross():
     assert "期间无交易" in metrics.notes
 
 
+def test_run_backtest_from_snapshot():
+    """走数据模块真实链路：make_synthetic_snapshot → load_snapshot → run_backtest。"""
+    meta = make_synthetic_snapshot(["510300", "510500"], "2023-01-01", "2024-12-31", seed=1)
+
+    config = StrategyConfig(
+        template="ma_cross",
+        symbols=["510300"],
+        start="2023-01-01",
+        end="2024-12-31",
+        params={"fast": 5, "slow": 20},
+        snapshot_id=meta.snapshot_id,
+    )
+
+    trades, daily, metrics = run_backtest_from_snapshot(config, benchmark_symbol="510500")
+
+    assert not daily.empty
+    assert (daily["symbol"] == "__TOTAL__").any()
+    assert metrics.n_trades == len(trades)
+
+
 if __name__ == "__main__":
     test_ma_cross_runs_end_to_end()
     test_short_history_skips_annualization()
     test_no_trades_when_no_cross()
+    test_run_backtest_from_snapshot()
     print("all tests passed")

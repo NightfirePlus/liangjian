@@ -17,10 +17,25 @@
       "Bash(python -c \"from core.backtest.engine import run_backtest; from core.backtest import signals, metrics; print\\('imports ok'\\)\")",
       "Bash(git rm *)",
       "Bash(cat .gitignore)",
-      "Bash(ls -la .claude)"
+      "Bash(ls -la .claude)",
+      "Bash(git fetch *)",
+      "Bash(git pull *)",
+      "Bash(python -m pytest -q)",
+      "Bash(ls -la \"/d/泛/liangjian_modelscope\" 2>&1; echo \"---gitignore---\"; cat \"/d/泛/量见/.gitignore\" 2>/dev/null; echo \"---data dir---\"; ls \"/d/泛/量见/data\" 2>/dev/null)",
+      "Read(//d/泛/liangjian_modelscope/**)",
+      "Bash(rsync -a --exclude='.git/' --exclude='__pycache__/' --exclude='.pytest_cache/' --exclude='.venv/' --exclude='.env' --exclude='.claude/settings.local.json' ./ \"/d/泛/liangjian_modelscope/\")",
+      "Bash(rm -rf \"/d/泛/liangjian_modelscope_tmp_copy\")",
+      "Bash(cd \"/d/泛/量见\" && ls -la)",
+      "Read(//d/d/泛/**)",
+      "Bash(cp -r core __TRACKED_VAR__/)",
+      "Bash(cp -r data __TRACKED_VAR__/)",
+      "Bash(cp -r tests __TRACKED_VAR__/)",
+      "Bash(cp app.py config.py conftest.py requirements.txt .env.example .gitignore __TRACKED_VAR__/)"
     ],
     "additionalDirectories": [
-      "C:\\Users\\Nightfire\\.ssh"
+      "C:\\Users\\Nightfire\\.ssh",
+      "D:\\泛\\liangjian_modelscope_tmp_copy",
+      "d:\\泛\\liangjian_modelscope"
     ]
   }
 }
