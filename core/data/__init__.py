@@ -4,7 +4,8 @@
 """
 from core.data.snapshot import (
     SNAPSHOT_DIR, build_snapshot, cache_size_bytes, clean_snapshots, list_snapshots,
-    load_snapshot, make_synthetic_snapshot, pin_snapshot, unpin_snapshot,
+    ensure_market_snapshot, find_covering_snapshot, load_snapshot, make_synthetic_snapshot,
+    pin_snapshot, unpin_snapshot,
 )
 from core.data.sources import fetch_etf_daily, source_name
 from core.data.universe import (
@@ -15,7 +16,8 @@ from core.data.validate import validate_prices
 __all__ = [
     "ANOMALY_LIMIT", "DEFAULT_UNIVERSE", "EtfInfo", "SNAPSHOT_DIR",
     "anomaly_limit", "build_snapshot", "cache_size_bytes", "category_of",
-    "clean_snapshots", "fetch_etf_daily", "get_etf", "get_universe",
+    "clean_snapshots", "ensure_market_snapshot", "fetch_etf_daily",
+    "find_covering_snapshot", "get_etf", "get_universe",
     "list_snapshots", "load_snapshot", "make_synthetic_snapshot",
     "pin_snapshot", "source_name", "unpin_snapshot", "validate_prices",
 ]

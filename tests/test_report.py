@@ -93,6 +93,23 @@ def test_llm_tool_roundtrip(pack):
     assert '"tool_results"' in seen[-1] and '"fast": 3' in seen[-1]
 
 
+def test_llm_retries_after_evidence_validation_error(pack):
+    invalid = {"findings": deepcopy(fact_report(pack))}
+    invalid["findings"][0]["statement_template"] = "收益高达99%。"
+    invalid["findings"][0]["values"] = {}
+    answers = iter([invalid, {"findings": fact_report(pack)}])
+    seen = []
+
+    def complete(system, user):
+        seen.append(user)
+        return next(answers)
+
+    report = generate_report(pack, use_llm=True, complete=complete)
+    assert report["mode"] == "ai"
+    assert report["validation_retries"] == 1
+    assert '"validation_feedback"' in seen[-1]
+
+
 def test_llm_failure_and_budget_fall_back(pack):
     def failing(*args):
         raise LLMError("unavailable")

@@ -174,6 +174,49 @@ def test_build_snapshot_cache_fallback(snap_dir, monkeypatch):
     assert meta2.snapshot_id != meta.snapshot_id  # 数据不同,id 不同
 
 
+def test_ensure_market_snapshot_reuses_covering_real_cache(snap_dir, monkeypatch):
+    calls = []
+
+    def fetch(symbol, start, end, adjust="qfq"):
+        calls.append((symbol, start, end, adjust))
+        frame = make_bars(symbol, start="2025-01-02", n=130)
+        frame.attrs["source"] = "test/source"
+        return frame
+
+    monkeypatch.setattr(snap, "fetch_etf_daily", fetch)
+    original, _ = snap.build_snapshot(["510300"], "2025-01-01", "2025-06-30")
+    calls.clear()
+
+    meta, report, cache_hit = snap.ensure_market_snapshot(
+        ["510300"], "2025-01-01", "2025-06-30",
+    )
+
+    assert cache_hit is True
+    assert meta.snapshot_id == original.snapshot_id
+    assert not report.has_error
+    assert calls == []
+
+
+def test_ensure_market_snapshot_fetches_and_caches_when_missing(snap_dir, monkeypatch):
+    calls = []
+
+    def fetch(symbol, start, end, adjust="qfq"):
+        calls.append((symbol, start, end, adjust))
+        frame = make_bars(symbol, start="2025-01-02", n=130)
+        frame.attrs["source"] = "test/source"
+        return frame
+
+    monkeypatch.setattr(snap, "fetch_etf_daily", fetch)
+    meta, report, cache_hit = snap.ensure_market_snapshot(
+        ["510300"], "2025-01-01", "2025-06-30",
+    )
+
+    assert cache_hit is False
+    assert calls == [("510300", "2025-01-01", "2025-06-30", "qfq")]
+    assert not report.has_error
+    assert snap.find_covering_snapshot(["510300"], "2025-01-01", "2025-06-30") == meta
+
+
 # ---------------------------------------------------------------- 数据源降级
 def test_fetch_falls_back_to_tencent(monkeypatch):
     # 东财限流 → 自动降级腾讯源;成交量 股→手;来源写入 df.attrs

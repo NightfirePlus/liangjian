@@ -19,6 +19,7 @@ from streamlit.testing.v1 import AppTest
 
 import config
 from core.data import build_snapshot, load_snapshot, make_synthetic_snapshot
+import core.nlp.parser as parser_mod
 from core.report.export import evidence_filename
 
 
@@ -26,13 +27,36 @@ def run(snapshot_id: str, output: Path) -> dict:
     prices, meta, quality = load_snapshot(snapshot_id)
     assert not quality.has_error, "快照存在错误级质量问题"
     # 禁用所有 HTTP 请求：界面及计算阶段只能读取已冻结快照。
-    with patch.object(config, "LLM_AVAILABLE", False), patch(
+    with patch.object(config, "LLM_AVAILABLE", False), patch.object(
+        parser_mod, "LLM_AVAILABLE", False,
+    ), patch(
         "requests.sessions.Session.request", side_effect=AssertionError("验收期间不应调用模型或联网")
     ):
         app = AppTest.from_file(str(ROOT / "app.py"), default_timeout=90).run()
         assert not app.exception, [e.value for e in app.exception]
         app.selectbox[0].select(snapshot_id).run()
-        next(b for b in app.button if b.label == "运行回测").click().run()
+        # 三种入口都写入同一份草案；先验证模板与快捷创建，再用多轮对话形成最终草案。
+        next(b for b in app.button if b.label == "10日 / 30日").click().run()
+        assert app.session_state["strategy_draft"].origin == "preset"
+        assert (app.session_state["strategy_draft"].fast, app.session_state["strategy_draft"].slow) == (10, 30)
+        next(b for b in app.button if b.label == "生成策略草案").click().run()
+        assert app.session_state["strategy_draft"].origin == "quick"
+        assert (app.session_state["strategy_draft"].fast, app.session_state["strategy_draft"].slow) == (5, 20)
+
+        app.chat_input[0].set_value("用沪深300ETF测试双均线策略").run()
+        assert app.session_state["strategy_draft"].origin == "quick"  # 信息不足时不覆盖现有草案
+        requested_start = (pd.Timestamp(meta.actual_start) - pd.Timedelta(days=1)).date().isoformat()
+        app.chat_input[0].set_value(
+            f"使用5日和20日，回测{requested_start}到{meta.actual_end}"
+        ).run()
+        draft = app.session_state["strategy_draft"]
+        assert draft.origin == "conversation" and (draft.fast, draft.slow) == (5, 20)
+        assert draft.symbol == "510300"
+        assert draft.start == meta.actual_start and draft.normalization_notes
+
+        next(b for b in app.button if b.label == "确认这份策略").click().run()
+        assert app.session_state["confirmed_draft_hash"] == draft.execution_hash(snapshot_id)
+        next(b for b in app.button if b.label == "开始验证并生成报告").click().run()
         assert not app.exception, [e.value for e in app.exception]
         backtest = app.session_state["backtest_result"]
         assert backtest["config"].snapshot_id == snapshot_id
@@ -44,13 +68,10 @@ def run(snapshot_id: str, output: Path) -> dict:
         computed_return = total["equity"].iloc[-1] / total["equity"].iloc[0] - 1
         assert abs(computed_return - backtest["metrics"].total_return) < 1e-10
 
-        next(b for b in app.button if b.label == "运行完整验证实验").click().run()
-        assert not app.exception, [e.value for e in app.exception]
         suite = app.session_state["validation_result"]["report"]
         assert suite.verdict is None
         assert abs(suite.baseline["total_return"] - computed_return) < 1e-10
         assert all(r.get("error") is None for exp in suite.experiments.values() for r in exp.rows)
-        assert next(b for b in app.button if b.label == "生成 AI 分析").disabled
         saved = app.session_state["evidence_result"]
         pack, report, bundle = saved["pack"], saved["analysis"], saved["bundle"]
         assert report["mode"] == "facts" and not report["tool_log"]
@@ -88,6 +109,8 @@ def run(snapshot_id: str, output: Path) -> dict:
         "version": config.APP_VERSION,
         "checked_at": datetime.now(timezone.utc).isoformat(),
         "status": "passed", "llm": "skipped; HTTP forbidden during UI run",
+        "strategy_entry_points": ["preset", "quick", "conversation"],
+        "strategy_confirmation_required": True,
         "snapshot_id": snapshot_id, "source": meta.source,
         "is_synthetic": meta.is_synthetic, "price_rows": len(prices),
         "actual_start": meta.actual_start, "actual_end": meta.actual_end,

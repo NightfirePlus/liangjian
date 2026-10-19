@@ -10,16 +10,15 @@ import json
 
 import requests
 
-from config import LLM_API_KEY, LLM_BASE_URL, LLM_MODEL
+from config import LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, LLM_TIMEOUT_SECONDS
 
-_TIMEOUT_SECONDS = 30
 
 
 class LLMError(Exception):
     """大模型调用失败或返回内容不是合法 JSON，统一包成这个异常供上层捕获降级。"""
 
 
-def complete_json(system_prompt: str, user_prompt: str) -> dict:
+def complete_json(system_prompt: str, user_prompt: str, *, model: str | None = None) -> dict:
     """调用大模型，要求其只返回一个 JSON object，解析后以 dict 形式返回。
 
     失败（网络错误、HTTP 非 2xx、返回内容无法解析为 JSON）统一抛 LLMError。
@@ -30,7 +29,7 @@ def complete_json(system_prompt: str, user_prompt: str) -> dict:
         "Content-Type": "application/json",
     }
     payload = {
-        "model": LLM_MODEL,
+        "model": model or LLM_MODEL,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
@@ -39,7 +38,7 @@ def complete_json(system_prompt: str, user_prompt: str) -> dict:
     }
 
     try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=_TIMEOUT_SECONDS)
+        resp = requests.post(url, headers=headers, json=payload, timeout=LLM_TIMEOUT_SECONDS)
         resp.raise_for_status()
         data = resp.json()
         content = data["choices"][0]["message"]["content"]

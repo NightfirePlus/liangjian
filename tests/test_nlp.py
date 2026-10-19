@@ -9,6 +9,7 @@ import pytest
 
 import core.nlp.parser as parser_mod
 from core.nlp.defaults import apply_defaults, DEFAULT_ASSUMPTIONS
+from core.nlp.fallback import parse_with_rules
 from core.nlp.validate import validate_candidate
 
 
@@ -106,6 +107,38 @@ def test_parser_degrades_when_llm_unavailable(monkeypatch):
     assert result.degraded_reason
 
 
+def test_relative_years_use_market_snapshot_end_instead_of_model_date(monkeypatch):
+    monkeypatch.setattr(parser_mod, "LLM_AVAILABLE", True)
+    candidate = {
+        "template": "ma_cross", "symbol_mentions": ["沪深300ETF"], "symbols": ["510300"],
+        "start": "2022-09-26", "end": "2024-09-26", "params": {"fast": 5, "slow": 20},
+        "overrides": {}, "claim_text": None, "ambiguities": [], "missing": [],
+    }
+    monkeypatch.setattr(parser_mod, "complete_json", _mock_complete_json(candidate))
+
+    result = parser_mod.parse_user_input(
+        "用沪深300ETF测试双均线，5日线上穿20日线买入，回测近两年。",
+        reference_end="2024-12-31",
+    )
+
+    assert result.strategy_config.start == "2022-12-31"
+    assert result.strategy_config.end == "2024-12-31"
+    assert result.raw_candidate["_relative_period_years"] == 2
+
+
+def test_latest_explicit_dates_override_earlier_relative_period(monkeypatch):
+    monkeypatch.setattr(parser_mod, "LLM_AVAILABLE", False)
+    result = parser_mod.parse_user_input(
+        "510300双均线，5日和20日，回测近两年。\n"
+        "改成2023-01-02到2024-12-31",
+        reference_end="2024-12-31",
+    )
+
+    assert result.strategy_config.start == "2023-01-02"
+    assert result.strategy_config.end == "2024-12-31"
+    assert "_relative_period_years" not in result.raw_candidate
+
+
 def test_parser_degrades_on_llm_error(monkeypatch):
     monkeypatch.setattr(parser_mod, "LLM_AVAILABLE", True)
 
@@ -116,6 +149,18 @@ def test_parser_degrades_on_llm_error(monkeypatch):
     result = parser_mod.parse_user_input("随便测一个策略")
     assert result.degraded is True
     assert "网络超时" in result.degraded_reason
+
+
+def test_rule_fallback_uses_latest_multi_turn_changes():
+    candidate = parse_with_rules(
+        "510300双均线，5日和20日，2023-01-01到2024-01-01\n"
+        "改成510500，10日和30日，2022-01-01到2025-01-01"
+    )
+
+    assert candidate["symbols"] == ["510500"]
+    assert candidate["params"] == {"fast": 10, "slow": 30}
+    assert candidate["start"] == "2022-01-01"
+    assert candidate["end"] == "2025-01-01"
 
 
 # ---------------------------------------------------------------- parser: 端到端

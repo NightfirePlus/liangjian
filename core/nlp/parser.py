@@ -5,6 +5,9 @@
 """
 from __future__ import annotations
 
+from datetime import date
+import re
+
 from config import LLM_AVAILABLE
 from core.nlp.clarify import generate_questions
 from core.nlp.confirm import build_confirmation_text
@@ -23,13 +26,19 @@ _CLAIM_KEYWORDS: dict[str, tuple[str, ...]] = {
 }
 
 
-def parse_user_input(text: str, history: list[dict] | None = None) -> ParseResult:
+def parse_user_input(
+    text: str,
+    history: list[dict] | None = None,
+    *,
+    reference_end: str | None = None,
+) -> ParseResult:
     """text 为用户本轮输入；history 为之前的追问往返（见 schema_prompt.build_user_prompt）。
 
     返回 ParseResult：needs_clarification=True 时等待用户补充信息，
     False 时 strategy_config 已经可以直接送入 core/backtest。
     """
     candidate, degraded, degraded_reason = _get_candidate(text, history)
+    candidate = _resolve_relative_period(candidate, text, reference_end)
 
     validation = validate_candidate(candidate)
     if not validation.ok:
@@ -58,6 +67,55 @@ def parse_user_input(text: str, history: list[dict] | None = None) -> ParseResul
         degraded_reason=degraded_reason,
         raw_candidate=candidate,
     )
+
+
+_RELATIVE_YEAR_PATTERN = re.compile(r"(?:近|最近|过去)\s*([一二两三四五六七八九十\d]+)\s*年")
+_EXPLICIT_DATE_PATTERN = re.compile(r"20\d{2}(?:[-/.年])\d{1,2}(?:[-/.月])\d{1,2}")
+
+
+def _resolve_relative_period(candidate: dict, text: str, reference_end: str | None) -> dict:
+    """以行情截止日解释“近 N 年”，避免模型按错误的系统日期自行换算。"""
+    if not reference_end:
+        return candidate
+    relative_matches = list(_RELATIVE_YEAR_PATTERN.finditer(text))
+    if not relative_matches:
+        return candidate
+    latest_relative = relative_matches[-1]
+    explicit_matches = list(_EXPLICIT_DATE_PATTERN.finditer(text))
+    if explicit_matches and explicit_matches[-1].start() > latest_relative.start():
+        return candidate
+
+    years = _chinese_integer(latest_relative.group(1))
+    if years is None or years <= 0:
+        return candidate
+    try:
+        end = date.fromisoformat(reference_end)
+    except ValueError:
+        return candidate
+    try:
+        start = end.replace(year=end.year - years)
+    except ValueError:  # 2 月 29 日向前落到非闰年时取 2 月 28 日。
+        start = end.replace(year=end.year - years, day=28)
+
+    resolved = dict(candidate)
+    resolved["start"] = start.isoformat()
+    resolved["end"] = end.isoformat()
+    resolved["_relative_period_years"] = years
+    resolved["_relative_period_reference_end"] = end.isoformat()
+    return resolved
+
+
+def _chinese_integer(value: str) -> int | None:
+    if value.isdigit():
+        return int(value)
+    digits = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5,
+              "六": 6, "七": 7, "八": 8, "九": 9}
+    if value == "十":
+        return 10
+    if "十" in value:
+        left, right = value.split("十", 1)
+        return digits.get(left, 1) * 10 + digits.get(right, 0)
+    return digits.get(value)
 
 
 def _get_candidate(text: str, history: list[dict] | None) -> tuple[dict, bool, str]:

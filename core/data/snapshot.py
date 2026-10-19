@@ -251,6 +251,63 @@ def _find_cached_prices(symbol: str, start: str, end: str,
     return best
 
 
+def find_covering_snapshot(
+    symbols: list[str], start: str, end: str, adjust: str = "qfq",
+) -> SnapshotMeta | None:
+    """查找完整覆盖请求区间的真实本地快照。"""
+    requested_symbols = set(str(symbol).strip() for symbol in symbols if str(symbol).strip())
+    if not requested_symbols:
+        return None
+    start_ts, end_ts = pd.Timestamp(start), pd.Timestamp(end)
+    tolerance = pd.Timedelta(days=_COVER_TOLERANCE_DAYS)
+    matches: list[tuple[SnapshotMeta, Path]] = []
+    for meta_file in SNAPSHOT_DIR.glob("*/meta.json"):
+        meta = _read_meta(meta_file.parent)
+        if (
+            meta is None
+            or meta.is_synthetic
+            or meta.adjust != adjust
+            or not requested_symbols.issubset(set(meta.symbols))
+        ):
+            continue
+        prices_file = meta_file.parent / "prices.csv"
+        if not prices_file.exists():
+            continue
+        prices = pd.read_csv(prices_file, parse_dates=["date"], dtype={"symbol": str})
+        covered = True
+        for symbol in requested_symbols:
+            part = prices[prices["symbol"] == symbol]
+            if (
+                part.empty
+                or part["date"].min() > start_ts + tolerance
+                or part["date"].max() < end_ts - tolerance
+            ):
+                covered = False
+                break
+        if covered:
+            matches.append((meta, meta_file.parent))
+    if not matches:
+        return None
+    meta, directory = max(matches, key=lambda item: item[0].fetched_at)
+    _touch_access(directory)
+    return meta
+
+
+def ensure_market_snapshot(
+    symbols: list[str], start: str, end: str, adjust: str = "qfq",
+) -> tuple[SnapshotMeta, QualityReport, bool]:
+    """优先复用本地真实行情；无覆盖数据时联网获取并固化快照。
+
+    返回 ``(meta, quality, cache_hit)``。回测仍只读取固定快照，保证结果可复现。
+    """
+    cached = find_covering_snapshot(symbols, start, end, adjust)
+    if cached is not None:
+        _prices, meta, report = load_snapshot(cached.snapshot_id)
+        return meta, report, True
+    meta, report = build_snapshot(symbols, start, end, adjust=adjust, allow_cache_fallback=True)
+    return meta, report, False
+
+
 def build_snapshot(symbols: list[str], start: str, end: str, adjust: str = "qfq",
                    allow_cache_fallback: bool = True) -> tuple[SnapshotMeta, QualityReport]:
     """联网取数 → validate → 保存。snapshot_id 由内容哈希生成,同数据同 id。

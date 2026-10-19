@@ -9,6 +9,3 @@ data/raw/
 # 快照数据默认不提交(README:数据可否分发尚未核实,确认后再放开)
 data/snapshots/
 artifacts/
-
-# ModelScope 创空间部署副本(独立git仓库,远程URL含token,不入库)
-/liangjian/

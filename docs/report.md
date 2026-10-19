@@ -1,6 +1,7 @@
 # 证据报告 v1
 
-运行回测 → 运行完整验证实验 → 查看图表与事实摘要 → 可选点击“生成 AI 分析”。
+用户在 Agent 对话中确认策略后，Agent 连续执行回测、完整验证实验和报告生成，并在对话中显示进度。
+热力图、对比图、结论、逐结论证据和下载文件统一展示在对话下方。
 每条结论下展开证据；“下载报告与证据附件 ZIP”包含 Markdown、JSON、CSV 和离线 HTML 图表。
 
 ## 面向新手的报告规划
@@ -42,7 +43,12 @@
 ## 模型协议
 
 复用现有 `core.nlp.llm_client.complete_json` 及环境变量
-`LLM_API_KEY`、`LLM_BASE_URL`、`LLM_MODEL`。本项目不会自动读取 `.env`，需由启动环境导入。
+`LLM_API_KEY`、`LLM_BASE_URL`、`LLM_MODEL`。报告可用 `LLM_REPORT_MODEL` 单独选择更强的模型，
+未设置时沿用 `LLM_MODEL`；可用 `LLM_TIMEOUT_SECONDS` 调整长报告请求的超时秒数。
+本地启动时会自动读取仓库根目录的 `.env`；
+进程环境变量优先于文件内容，`.env` 已被 Git 忽略，不应提交真实密钥。
+可运行 `python scripts/llm_smoke.py --report` 检查接口连通、策略解析和四维度证据报告；
+脚本只输出模型名与验证结果，不输出 API Key。
 点击 AI 按钮后，实验摘要及模型请求的证据会发送到配置的模型服务。
 
 v1 使用 JSON 工具请求协议，不要求服务商支持原生 function calling：

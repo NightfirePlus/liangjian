@@ -22,26 +22,47 @@ def parse_with_rules(text: str) -> dict:
         "params": {}, "overrides": {}, "claim_text": None, "ambiguities": [], "missing": [],
     }
 
-    if any(k in text for k in _MA_CROSS_KEYWORDS):
-        candidate["template"] = "ma_cross"
-    elif any(k in text for k in _ROTATION_KEYWORDS):
-        candidate["template"] = "momentum_rotation"
+    template_mentions = [
+        (text.rfind(keyword), template)
+        for template, keywords in (
+            ("ma_cross", _MA_CROSS_KEYWORDS),
+            ("momentum_rotation", _ROTATION_KEYWORDS),
+        )
+        for keyword in keywords
+        if keyword in text
+    ]
+    if template_mentions:
+        candidate["template"] = max(template_mentions)[1]
 
+    # 当前执行器是单标的；多轮修改时以最后一次出现的受支持标的为准。
+    symbol_mentions = []
     for etf in get_universe():
-        if etf.symbol in text or etf.name in text or etf.name.replace("ETF", "") in text:
-            candidate["symbols"].append(etf.symbol)
-            candidate["symbol_mentions"].append(etf.name)
+        positions = [
+            text.rfind(alias)
+            for alias in (etf.symbol, etf.name, etf.name.replace("ETF", ""))
+            if alias and alias in text
+        ]
+        if positions:
+            symbol_mentions.append((max(positions), etf))
+    if symbol_mentions:
+        _position, selected = max(symbol_mentions, key=lambda item: item[0])
+        candidate["symbols"] = [selected.symbol]
+        candidate["symbol_mentions"] = [selected.name]
 
     dates = _DATE_PATTERN.findall(text)
     if len(dates) >= 1:
-        y, m, d = dates[0]
+        y, m, d = dates[-2] if len(dates) >= 2 else dates[-1]
         candidate["start"] = f"{y}-{int(m):02d}-{int(d):02d}"
     if len(dates) >= 2:
-        y, m, d = dates[1]
+        y, m, d = dates[-1]
         candidate["end"] = f"{y}-{int(m):02d}-{int(d):02d}"
 
-    nums = re.findall(r"(\d+)\s*日", text)
-    if candidate["template"] == "ma_cross" and len(nums) >= 2:
-        candidate["params"] = {"fast": int(nums[0]), "slow": int(nums[1])}
+    pairs = re.findall(
+        r"(\d+)\s*日(?:均线)?[^\d]{0,12}(\d+)\s*日(?:均线)?",
+        text,
+    )
+    if candidate["template"] == "ma_cross" and pairs:
+        fast, slow = pairs[-1]
+        candidate["params"] = {"fast": int(fast), "slow": int(slow)}
 
     return candidate

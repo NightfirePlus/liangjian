@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import re
 
-from config import LLM_AVAILABLE, LLM_MODEL
+from config import LLM_AVAILABLE, LLM_REPORT_MODEL
 from core.nlp.llm_client import LLMError, complete_json
 from core.report.evidence import EvidenceTools, dumps
 
@@ -17,13 +17,17 @@ SYSTEM_PROMPT = """你是量见的历史实验报告分析助手。只分析本�
 不添加交易建议。区分 fact（直接事实）和 diagnosis（有限解释）。结论必须有具体证据。
 可调用只读工具：get_evidence(evidence_id)，get_parameter_cell(fast,slow)。
 工具请求 JSON：{"tool_calls":[{"name":"get_evidence","arguments":{"evidence_id":"目录中的ID"}}]}。
-最终输出 JSON：{"findings":[{"dimension":"baseline","title":"历史表现","level":"diagnosis",
+最终只输出四条结论，按 baseline、cost、parameters、periods 排列，每个维度恰好一条。JSON：
+{"findings":[{"dimension":"baseline","title":"历史表现","level":"diagnosis",
 "statement_template":"原始策略超额收益为{v0}，该观察仅适用于已测历史区间。",
 "values":{"v0":{"evidence_id":"目录中的ID","path":["excess_return"],"format":"percent"}},
 "evidence_refs":["目录中的ID"],"limitations":["尚未进行样本外验证。"]}]}。
-每个维度至少一条、总计不超过八条结论。values 可为空；有数字时必须用 {v0} 等占位符，
+优先使用各维度的 baseline 或 summary 证据；如引用 table，必须同时引用本维度的 summary 或 table。
+values 可为空；有数字时必须用 {v0} 等占位符，
 数值由程序从引用证据 data 中按 path（字段名或行索引组成的数组）读取，不能自编数字。
 format 只允许 percent/number/text；数值直接用字段引用。标题、正文及限制不要直接写阿拉伯数字。
+标题、statement_template 和 limitations 中连实验数量、范围、比例也不得直接出现阿拉伯数字；
+要么通过 values 占位符引用证据，要么改用不含数字的定性表述。
 不得自行计算派生数值；需要引用已有 summary。每条至少包含一条有效 metrics/table/summary 证据，
 可以额外引用 chart。局限说明必填。confidence 不需要输出。
 """
@@ -96,8 +100,19 @@ def validate_findings(candidate, pack):
         plain = re.sub(r"\{v\d+\}", "", template)
         if set(slots) != set(bindings) or "{" in plain or "}" in plain:
             raise ValueError("数值占位符不匹配")
-        if re.search(r"\d", plain + title + "".join(limitations)):
-            raise ValueError("数字必须引用证据字段")
+        digit_locations = []
+        if re.search(r"\d", title):
+            digit_locations.append(f"title={title!r}")
+        if re.search(r"\d", plain):
+            digit_locations.append(f"statement_template={template!r}")
+        for limitation_index, limitation in enumerate(limitations):
+            if re.search(r"\d", limitation):
+                digit_locations.append(f"limitations[{limitation_index}]={limitation!r}")
+        if digit_locations:
+            raise ValueError(
+                "以下位置含有未绑定的阿拉伯数字：" + "；".join(digit_locations)
+                + "。把数字改成 values 占位符并引用证据；没有对应证据时删除数字，改为定性表述。"
+            )
         statement = template
         for slot, binding in bindings.items():
             statement = statement.replace("{" + slot + "}", _get_value(pack, binding, refs))
@@ -154,7 +169,9 @@ def generate_report(pack, *, use_llm=False, complete=None):
     if complete is None and not LLM_AVAILABLE:
         result["notice"] = "模型未配置，已显示事实摘要。"
         return result
-    client = complete or complete_json
+    client = complete or (
+        lambda system, user: complete_json(system, user, model=LLM_REPORT_MODEL)
+    )
     tools = EvidenceTools(pack)
     seed = [e for e in pack["entries"].values() if e["kind"] in {"context", "metrics", "summary"}
             or e["id"] in {f"{pack['run_id']}:table:{slug}" for slug in ("cost", "parameters", "periods")}]
@@ -163,8 +180,18 @@ def generate_report(pack, *, use_llm=False, complete=None):
         for _ in range(4):
             answer = client(SYSTEM_PROMPT, dumps(messages))
             if isinstance(answer, dict) and "findings" in answer:
-                result["findings"] = validate_findings(answer, pack)
-                result.update(mode="ai", model=LLM_MODEL, notice="AI 分析；证据引用与数值字段已校验，解释仍需结合原始数据审阅。")
+                try:
+                    result["findings"] = validate_findings(answer, pack)
+                except (ValueError, KeyError, TypeError, IndexError, AttributeError) as error:
+                    # 把程序校验结果反馈给模型，让格式波动可以在同一 Agent 任务内自动修正。
+                    messages["validation_feedback"] = [{
+                        "error": str(error),
+                        "rejected_answer": answer,
+                        "instruction": "修正错误并重新输出完整 findings；不得放宽证据与数字约束。",
+                    }]
+                    result["validation_retries"] = result.get("validation_retries", 0) + 1
+                    continue
+                result.update(mode="ai", model=LLM_REPORT_MODEL, notice="AI 分析；证据引用与数值字段已校验，解释仍需结合原始数据审阅。")
                 return result
             calls = answer.get("tool_calls") if isinstance(answer, dict) else None
             if not isinstance(calls, list) or not 1 <= len(calls) <= 4:
@@ -175,7 +202,10 @@ def generate_report(pack, *, use_llm=False, complete=None):
                 item = {"name": name, "arguments": args, "result": evidence}
                 messages["tool_results"].append(item)
                 result["tool_log"].append({"name": name, "arguments": args})
-        raise ValueError("超出模型工具调用轮数")
-    except (LLMError, ValueError, KeyError, TypeError, IndexError, AttributeError):
+        feedback = messages.get("validation_feedback", [])
+        detail = feedback[-1]["error"] if feedback else "模型未完成最终输出"
+        raise ValueError(f"超出模型工具调用轮数：{detail}")
+    except (LLMError, ValueError, KeyError, TypeError, IndexError, AttributeError) as error:
+        result["error"] = str(error)
         result["notice"] = "AI 调用或证据校验未完成，已回退为事实摘要。"
         return result
