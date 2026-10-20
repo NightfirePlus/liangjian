@@ -22,6 +22,19 @@ REQUIRED_PARAMS: dict[str, list[str]] = {
 }
 SUPPORTED_TEMPLATES = tuple(REQUIRED_PARAMS.keys())
 
+_PARAMETER_QUESTIONS = {
+    "fast": "短期平均价格看最近多少个交易日",
+    "slow": "长期平均价格看最近多少个交易日",
+    "entry_window": "买入时，与最近多少个交易日的最高价比较",
+    "exit_window": "卖出时，与最近多少个交易日的最低价比较",
+    "rsi_period": "用最近多少个交易日计算涨跌强弱",
+    "buy_threshold": "指标低于多少时买入",
+    "sell_threshold": "指标高于多少时卖出",
+    "lookback": "比较最近多少个交易日的涨幅",
+    "top_n": "选涨幅靠前的几只基金",
+    "rebalance": "多久重新挑选一次",
+}
+
 
 @dataclass
 class ValidationIssue:
@@ -45,17 +58,17 @@ def validate_candidate(candidate: dict) -> ValidationResult:
     template = candidate.get("template")
     if template not in SUPPORTED_TEMPLATES:
         issues.append(ValidationIssue(
-            "template", "没看出你想用哪种策略模板（目前可执行双均线、价格突破和 RSI 均值回归）"))
+            "template", "你想在什么情况下买入、卖出？可以举个具体例子。"))
 
     symbols = candidate.get("symbols") or []
     ambiguities = candidate.get("ambiguities") or []
     if not symbols and not ambiguities:
-        issues.append(ValidationIssue("symbols", "没识别出具体的标的，需要补充想测试哪个 ETF"))
+        issues.append(ValidationIssue("symbols", "你想测试哪只基金？告诉我名称或代码就行，比如沪深300基金（510300）。"))
     else:
         unknown = [s for s in symbols if get_etf(s) is None]
         if unknown:
             issues.append(ValidationIssue(
-                "symbols", f"标的代码 {', '.join(unknown)} 不在当前支持的资产池内"))
+                "symbols", f"暂时不支持代码 {', '.join(unknown)}，请从侧栏选择一只支持的基金。"))
     for amb in ambiguities:
         issues.append(ValidationIssue("symbols", amb))
 
@@ -63,8 +76,13 @@ def validate_candidate(candidate: dict) -> ValidationResult:
         params = candidate.get("params") or {}
         missing_params = [p for p in REQUIRED_PARAMS[template] if p not in params or params[p] in (None, "")]
         if missing_params:
+            questions = "；".join(_PARAMETER_QUESTIONS[p] for p in missing_params)
+            explanation = (
+                "这里的 RSI 是一个衡量近期涨跌强弱的指标，数值在0到100之间。"
+                if template == "rsi_reversion" else ""
+            )
             issues.append(ValidationIssue(
-                "params", f"策略参数缺少 {', '.join(missing_params)}，需要补充具体数值"))
+                "params", f"{explanation}还想确认：{questions}？"))
         elif template == "ma_cross":
             try:
                 fast, slow = int(params["fast"]), int(params["slow"])
@@ -92,22 +110,26 @@ def validate_candidate(candidate: dict) -> ValidationResult:
                 buy = float(params["buy_threshold"])
                 sell = float(params["sell_threshold"])
                 if period <= 0:
-                    issues.append(ValidationIssue("params", "RSI 周期必须是正整数"))
+                    issues.append(ValidationIssue("params", "计算涨跌强弱的天数需要填大于0的整数，比如14。"))
                 elif not 0 < buy < sell < 100:
                     issues.append(ValidationIssue(
-                        "params", "RSI 阈值必须满足 0 < 买入阈值 < 卖出阈值 < 100"))
+                        "params", "买入时的指标数值要小于卖出时的数值，两个数都要在0到100之间。"))
             except (TypeError, ValueError):
-                issues.append(ValidationIssue("params", "RSI 周期和阈值必须是数字"))
+                issues.append(ValidationIssue("params", "请用数字填写计算天数，以及买入、卖出时的指标数值。"))
 
     start, end = candidate.get("start"), candidate.get("end")
     if not start or not end:
-        issues.append(ValidationIssue("period", "没说清楚回测的起止日期"))
+        if start:
+            question = "想测到哪一天？比如2025-12-31。"
+        elif end:
+            question = "想从哪一天开始测试？比如2023-01-01。"
+        else:
+            question = "想用哪段时间的历史行情测试？比如2023-01-01到2025-12-31。"
+        issues.append(ValidationIssue("period", question))
     elif start >= end:
         issues.append(ValidationIssue("period", f"起始日期({start})不能晚于/等于结束日期({end})"))
 
-    for extra_missing in candidate.get("missing") or []:
-        # 大模型自己标注的缺失项，去重后一并纳入（规则兜底里基本不会有这个字段）
-        if not any(extra_missing == i.message for i in issues):
-            issues.append(ValidationIssue("missing", extra_missing))
+    # 缺失项由上面的程序校验统一判断。模型的 missing 可能包含内部字段名、
+    # 重复问题，甚至与实际已提供的信息矛盾，不能直接展示或阻止用户继续。
 
     return ValidationResult(issues=issues)

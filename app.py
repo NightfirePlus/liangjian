@@ -1047,9 +1047,9 @@ if idea_text and idea_text.strip():
             complete=llm_complete,
         )
     if parsed.needs_clarification:
-        reply = "还需要你补充：\n\n" + "\n".join(f"- {question}" for question in parsed.questions)
+        reply = "为了帮你测试，想再确认：\n\n" + "\n".join(f"- {question}" for question in parsed.questions)
         if parsed.degraded:
-            reply += "\n\n当前使用基础规则识别，你也可以使用侧栏快捷创建。"
+            reply += "\n\n暂时只能识别简单描述，也可以在侧栏选择示例开始。"
         _append_chat("assistant", reply)
     else:
         try:
@@ -1130,23 +1130,22 @@ if idea_text and idea_text.strip():
     st.rerun()
 
 
-st.title("量化策略验证 Agent")
-st.caption("用对话把投资想法变成可验证策略；图表、结论和证据会出现在对话下方。")
+st.title("量化策略验证")
+st.caption("说说你的投资想法，用历史行情试一试，看看过去会怎样。")
 if snapshot_meta.is_synthetic:
     st.warning("当前使用模拟数据，只能验证系统流程，不能用于判断策略有效性。")
 if quality_report.has_error:
     st.error("当前行情存在错误级质量问题，请在侧栏更换数据。")
 if not llm_available:
-    st.info("模型尚未配置。请在侧栏“模型连接”中填写配置；未配置时 Agent 会使用基础规则和程序事实报告。")
+    st.info("还没连接 AI，暂时只能识别简单描述。可以在侧栏选择示例，或打开“模型连接”完成设置。")
 
 with st.chat_message("assistant"):
     st.write(
-        "你好，我是量见。直接说出你的投资想法，我会追问缺失条件、整理策略草案，"
-        "经你确认后完成回测、验证实验和报告。"
+        "你好，我是量见。说说你想买什么、什么时候买卖。不用懂专业术语，我会帮你一步步说清楚。"
+        "你确认后，我们再用历史行情试一试。"
     )
     st.caption(
-        "例如：用沪深300ETF测试双均线，5日线上穿20日线买入；"
-        "测试价格突破；或用14日 RSI，低于30买入、高于70卖出。"
+        "比如：“我想买沪深300基金，跌得多时买，涨回来就卖。”规则还没想清楚也可以先聊。"
     )
 
 for message_index, message in enumerate(st.session_state.setdefault("strategy_chat", [])):

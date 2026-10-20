@@ -8,6 +8,7 @@ from __future__ import annotations
 import pytest
 
 import core.nlp.parser as parser_mod
+from core.nlp.clarify import generate_questions
 from core.nlp.defaults import apply_defaults, DEFAULT_ASSUMPTIONS
 from core.nlp.fallback import parse_with_rules
 from core.nlp.validate import validate_candidate
@@ -87,7 +88,7 @@ def test_validate_rsi_parameters():
 
     assert valid.ok
     assert not invalid.ok
-    assert any("RSI 阈值" in issue.message for issue in invalid.issues)
+    assert any(issue.field == "params" and "买入" in issue.message for issue in invalid.issues)
 
 
 def test_validate_period_order():
@@ -295,3 +296,76 @@ def test_parser_needs_clarification_collects_all_issues(monkeypatch):
     # 一轮内尽量把模板/标的/区间缺失都收集到，而不是只问一个就返回
     assert len(result.questions) >= 3
     assert result.raw_candidate == candidate
+
+
+def test_clarification_hides_model_field_names_and_duplicate_missing_items():
+    """复现新手看到 symbols / params.rsi_period 等重复缺失项的场景。"""
+    candidate = {
+        "template": "rsi_reversion", "symbols": [], "params": {},
+        "start": None, "end": None, "ambiguities": [],
+        "missing": [
+            "未指定标的；未指定RSI周期、超卖/超买阈值",
+            "symbols", "params.rsi_period", "params.buy_threshold", "params.sell_threshold",
+        ],
+    }
+    result = parser_mod.parse_user_input(
+        "跌得多就买，涨回来就卖", use_llm=True,
+        complete=_mock_complete_json(candidate),
+    )
+
+    assert result.needs_clarification
+    assert len(result.questions) == 3  # 基金、买卖规则、测试时间，各问一次。
+    reply = "\n".join(result.questions)
+    assert not any(name in reply for name in ("symbols", "params", "rsi_period", "buy_threshold", "sell_threshold"))
+    assert "衡量近期涨跌强弱" in reply  # 使用缩写时先解释。
+    assert "名称或代码" in reply
+    assert "历史行情" in reply
+
+
+@pytest.mark.parametrize("template", ["ma_cross", "breakout", "rsi_reversion", "momentum_rotation"])
+def test_missing_parameters_are_explained_in_chinese(template):
+    validation = validate_candidate({
+        "template": template, "symbols": ["510300"], "params": {},
+        "start": "2023-01-01", "end": "2024-01-01",
+    })
+    questions = generate_questions(validation.issues)
+
+    assert len(questions) == 1
+    assert "多少" in questions[0] or "几只" in questions[0]
+    assert "_" not in questions[0]
+
+
+def test_model_missing_cannot_block_an_already_complete_strategy():
+    candidate = {
+        "template": "ma_cross", "symbols": ["510300"], "params": {"fast": 5, "slow": 20},
+        "start": "2023-01-01", "end": "2024-01-01",
+        "missing": ["symbols", "params.fast", "回测时间"],
+    }
+    result = parser_mod.parse_user_input(
+        "510300双均线，5日和20日，2023-01-01到2024-01-01",
+        use_llm=True, complete=_mock_complete_json(candidate),
+    )
+
+    assert not result.needs_clarification
+    assert result.strategy_config is not None
+
+
+def test_vague_idea_is_not_assigned_an_indicator_by_local_parser():
+    result = parser_mod.parse_user_input("跌得多就买，涨回来就卖", use_llm=False)
+
+    assert result.needs_clarification
+    assert result.raw_candidate["template"] is None
+    assert len(result.questions) == 3
+    assert "RSI" not in "\n".join(result.questions)
+
+
+def test_only_missing_parameter_and_date_are_asked_again():
+    questions = generate_questions(validate_candidate({
+        "template": "rsi_reversion", "symbols": ["510300"],
+        "params": {"rsi_period": 14, "buy_threshold": 30},
+        "start": "2023-01-01", "end": None,
+    }).issues)
+
+    assert len(questions) == 2
+    assert "卖出" in questions[0] and "买入" not in questions[0]
+    assert "测到哪一天" in questions[1]
