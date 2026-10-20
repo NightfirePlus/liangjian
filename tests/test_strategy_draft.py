@@ -79,3 +79,45 @@ def test_candidate_fields_distinguish_input_from_defaults():
     })
 
     assert fields == ["策略类型", "交易标的", "测试区间", "快线周期", "慢线周期", "滑点"]
+
+
+def test_breakout_draft_roundtrip_and_validation():
+    config = StrategyConfig(
+        template="breakout",
+        symbols=["510300"],
+        start="2023-01-01",
+        end="2024-01-01",
+        params={"entry_window": 20, "exit_window": 10},
+    )
+
+    draft = StrategyDraft.from_config(config)
+    restored = draft.to_config("snapshot_breakout")
+
+    assert draft.entry_window == 20 and draft.exit_window == 10
+    assert restored.template == "breakout"
+    assert restored.params == {"entry_window": 20, "exit_window": 10}
+    assert restored.snapshot_id == "snapshot_breakout"
+    assert any(
+        "突破周期" in issue
+        for issue in replace(draft, entry_window=5, exit_window=10).validate()
+    )
+
+
+def test_rsi_draft_roundtrip_and_validation():
+    config = StrategyConfig(
+        template="rsi_reversion", symbols=["510300"],
+        start="2023-01-01", end="2024-01-01",
+        params={"rsi_period": 14, "buy_threshold": 30, "sell_threshold": 70},
+    )
+
+    draft = StrategyDraft.from_config(config)
+    restored = draft.to_config("snapshot_rsi")
+
+    assert restored.template == "rsi_reversion"
+    assert restored.params == {
+        "rsi_period": 14, "buy_threshold": 30.0, "sell_threshold": 70.0,
+    }
+    assert any(
+        "RSI 阈值" in issue
+        for issue in replace(draft, buy_threshold=80, sell_threshold=20).validate()
+    )

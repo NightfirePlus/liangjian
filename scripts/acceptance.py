@@ -34,7 +34,19 @@ def run(snapshot_id: str, output: Path) -> dict:
     ):
         app = AppTest.from_file(str(ROOT / "app.py"), default_timeout=90).run()
         assert not app.exception, [e.value for e in app.exception]
-        app.selectbox[0].select(snapshot_id).run()
+        next(b for b in app.button if b.label == "用双均线开始").click().run()
+        assert app.session_state["main_nav"] == "量化策略验证"
+        assert app.session_state["strategy_draft"].template == "ma_cross"
+        next(b for b in app.button if b.label.endswith("使用文档")).click().run()
+        assert any(title.value == "使用文档" for title in app.title)
+        next(b for b in app.button if b.label.endswith("AI 金融问答")).click().run()
+        next(b for b in app.button if b.label == "双均线策略有什么局限？").click().run()
+        assert len(app.session_state.get("finance_chat", [])) == 2
+        next(b for b in app.button if b.label == "用双均线创建验证草案").click().run()
+        assert app.session_state["main_nav"] == "量化策略验证"
+        assert app.session_state["strategy_draft"].template == "ma_cross"
+        snapshot_select = next(s for s in app.selectbox if s.label == "当前实验数据")
+        snapshot_select.select(snapshot_id).run()
         # 三种入口都写入同一份草案；先验证模板与快捷创建，再用多轮对话形成最终草案。
         next(b for b in app.button if b.label == "10日 / 30日").click().run()
         assert app.session_state["strategy_draft"].origin == "preset"
@@ -83,6 +95,19 @@ def run(snapshot_id: str, output: Path) -> dict:
         assert charts == 8, f"应展示原始回测及七张证据图，实际 {charts}"
         assert len(app.get("download_button")) == 3
 
+        # 报告完成后的普通追问只读取现有证据，不重新解析策略或运行回测。
+        strategy_inputs_before = list(app.session_state["strategy_input_history"])
+        validation_id_before = app.session_state["validation_result"]["report"].validation_id
+        app.chat_input[0].set_value("参数实验说明了什么？").run()
+        assert app.session_state["strategy_input_history"] == strategy_inputs_before
+        assert len(app.session_state.get("report_qa_history", [])) == 1, {
+            "qa_history": app.session_state.get("report_qa_history"),
+            "last_chat": app.session_state["strategy_chat"][-1],
+            "strategy_inputs": app.session_state.get("strategy_input_history"),
+        }
+        assert app.session_state["validation_result"]["report"].validation_id == validation_id_before
+        assert "证据附件" in app.session_state["strategy_chat"][-1]["content"]
+
         with ZipFile(BytesIO(bundle)) as archive:
             assert archive.testzip() is None
             names = archive.namelist()
@@ -102,6 +127,57 @@ def run(snapshot_id: str, output: Path) -> dict:
         assert not app.exception
         assert len(app.get("download_button")) == 0
 
+        # 第二种可执行模板也必须走完整 Agent 链路，而不只通过底层单元测试。
+        next(b for b in app.button if b.label == "新建对话").click().run()
+        next(b for b in app.button if b.label == "20日突破 / 10日退出").click().run()
+        breakout_draft = app.session_state["strategy_draft"]
+        assert breakout_draft.template == "breakout"
+        assert (breakout_draft.entry_window, breakout_draft.exit_window) == (20, 10)
+        next(b for b in app.button if b.label == "确认这份策略").click().run()
+        assert app.session_state["confirmed_draft_hash"] == breakout_draft.execution_hash(snapshot_id)
+        next(b for b in app.button if b.label == "开始验证并生成报告").click().run()
+        assert not app.exception, [e.value for e in app.exception]
+        breakout_backtest = app.session_state["backtest_result"]
+        breakout_suite = app.session_state["validation_result"]["report"]
+        assert breakout_backtest["config"].template == "breakout"
+        breakout_parameter_rows = breakout_suite.experiments[
+            "strategy_parameter_robustness"
+        ].rows
+        assert len(breakout_parameter_rows) == 9
+        assert all(
+            row["entry_window"] > row["exit_window"]
+            and row.get("error") is None
+            for row in breakout_parameter_rows
+        )
+        assert len(app.get("plotly_chart")) == 8
+
+        # RSI 均值回归同样贯通确认、回测、参数热力图和报告。
+        next(b for b in app.button if b.label == "新建对话").click().run()
+        next(b for b in app.button if b.label == "14日 RSI / 30买入 / 70卖出").click().run()
+        rsi_draft = app.session_state["strategy_draft"]
+        assert rsi_draft.template == "rsi_reversion"
+        assert (rsi_draft.rsi_period, rsi_draft.buy_threshold, rsi_draft.sell_threshold) == (
+            14, 30, 70,
+        )
+        next(b for b in app.button if b.label == "确认这份策略").click().run()
+        rsi_draft = app.session_state["strategy_draft"]
+        assert app.session_state["confirmed_draft_hash"] == rsi_draft.execution_hash(snapshot_id)
+        next(b for b in app.button if b.label == "开始验证并生成报告").click().run()
+        assert not app.exception, [e.value for e in app.exception]
+        rsi_backtest = app.session_state["backtest_result"]
+        rsi_suite = app.session_state["validation_result"]["report"]
+        assert rsi_backtest["config"].template == "rsi_reversion"
+        rsi_parameter_rows = rsi_suite.experiments[
+            "strategy_parameter_robustness"
+        ].rows
+        assert len(rsi_parameter_rows) == 9
+        assert all(
+            0 < row["buy_threshold"] < row["sell_threshold"] < 100
+            and row.get("error") is None
+            for row in rsi_parameter_rows
+        )
+        assert len(app.get("plotly_chart")) == 8
+
     output.mkdir(parents=True, exist_ok=True)
     filename = f"{snapshot_id}_report.zip"
     (output / filename).write_bytes(bundle)
@@ -110,7 +186,9 @@ def run(snapshot_id: str, output: Path) -> dict:
         "checked_at": datetime.now(timezone.utc).isoformat(),
         "status": "passed", "llm": "skipped; HTTP forbidden during UI run",
         "strategy_entry_points": ["preset", "quick", "conversation"],
+        "strategy_templates": ["ma_cross", "breakout", "rsi_reversion"],
         "strategy_confirmation_required": True,
+        "report_evidence_qa": True,
         "snapshot_id": snapshot_id, "source": meta.source,
         "is_synthetic": meta.is_synthetic, "price_rows": len(prices),
         "actual_start": meta.actual_start, "actual_end": meta.actual_end,
@@ -119,6 +197,10 @@ def run(snapshot_id: str, output: Path) -> dict:
         "findings": len(report["findings"]), "rendered_charts": charts,
         "archive_files": len(names), "archive": filename,
         "evidence_hash": pack["evidence_hash"], "stale_result_hidden": True,
+        "breakout_trade_rows": len(breakout_backtest["trades"]),
+        "breakout_parameter_points": len(breakout_parameter_rows),
+        "rsi_trade_rows": len(rsi_backtest["trades"]),
+        "rsi_parameter_points": len(rsi_parameter_rows),
     }
     (output / f"{snapshot_id}_acceptance.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     return summary

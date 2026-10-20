@@ -16,6 +16,8 @@ from core.data.universe import get_etf
 
 REQUIRED_PARAMS: dict[str, list[str]] = {
     "ma_cross": ["fast", "slow"],
+    "breakout": ["entry_window", "exit_window"],
+    "rsi_reversion": ["rsi_period", "buy_threshold", "sell_threshold"],
     "momentum_rotation": ["lookback", "top_n", "rebalance"],
 }
 SUPPORTED_TEMPLATES = tuple(REQUIRED_PARAMS.keys())
@@ -43,7 +45,7 @@ def validate_candidate(candidate: dict) -> ValidationResult:
     template = candidate.get("template")
     if template not in SUPPORTED_TEMPLATES:
         issues.append(ValidationIssue(
-            "template", "没看出你想用哪种策略模板（目前支持双均线 ma_cross、动量轮动 momentum_rotation）"))
+            "template", "没看出你想用哪种策略模板（目前可执行双均线、价格突破和 RSI 均值回归）"))
 
     symbols = candidate.get("symbols") or []
     ambiguities = candidate.get("ambiguities") or []
@@ -73,6 +75,29 @@ def validate_candidate(candidate: dict) -> ValidationResult:
                         "params", f"快线周期({fast})必须小于慢线周期({slow})，请确认哪个是快线哪个是慢线"))
             except (TypeError, ValueError):
                 issues.append(ValidationIssue("params", "均线周期必须是整数"))
+        elif template == "breakout":
+            try:
+                entry = int(params["entry_window"])
+                exit_ = int(params["exit_window"])
+                if entry <= 0 or exit_ <= 0:
+                    issues.append(ValidationIssue("params", "突破和退出周期必须是正整数"))
+                elif entry <= exit_:
+                    issues.append(ValidationIssue(
+                        "params", f"突破周期({entry})必须大于退出周期({exit_})"))
+            except (TypeError, ValueError):
+                issues.append(ValidationIssue("params", "突破和退出周期必须是整数"))
+        elif template == "rsi_reversion":
+            try:
+                period = int(params["rsi_period"])
+                buy = float(params["buy_threshold"])
+                sell = float(params["sell_threshold"])
+                if period <= 0:
+                    issues.append(ValidationIssue("params", "RSI 周期必须是正整数"))
+                elif not 0 < buy < sell < 100:
+                    issues.append(ValidationIssue(
+                        "params", "RSI 阈值必须满足 0 < 买入阈值 < 卖出阈值 < 100"))
+            except (TypeError, ValueError):
+                issues.append(ValidationIssue("params", "RSI 周期和阈值必须是数字"))
 
     start, end = candidate.get("start"), candidate.get("end")
     if not start or not end:

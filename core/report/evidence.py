@@ -122,15 +122,36 @@ def chart_for(pack, evidence_id):
         fig.add_trace(go.Scatter(x=frame["sell_date"], y=frame["net_pnl"].cumsum(), mode="lines+markers", name="累计已实现盈亏"))
         fig.update_layout(yaxis_title="已实现盈亏（元，不含未平仓持仓）")
     elif kind == "parameters":
-        grid = frame.pivot_table(index="fast", columns="slow", values="excess_return", dropna=False)
+        if "entry_window" in frame.columns:
+            row_key, column_key = "entry_window", "exit_window"
+            row_label, column_label = "突破周期", "退出周期"
+        elif "buy_threshold" in frame.columns:
+            row_key, column_key = "buy_threshold", "sell_threshold"
+            row_label, column_label = "超卖买入阈值", "超买卖出阈值"
+        else:
+            row_key, column_key = "fast", "slow"
+            row_label, column_label = "快线", "慢线"
+        grid = frame.pivot_table(
+            index=row_key,
+            columns=column_key,
+            values="excess_return",
+            dropna=False,
+        )
         fig.add_trace(go.Heatmap(x=grid.columns.tolist(), y=grid.index.tolist(),
                                 z=grid.to_numpy().tolist(), zmid=0, colorscale="RdYlGn",
                                 colorbar={"tickformat": ".1%"},
-                                hovertemplate="快线=%{y}<br>慢线=%{x}<br>超额收益=%{z:.2%}<extra></extra>"))
+                                hovertemplate=(
+                                    f"{row_label}=%{{y}}<br>{column_label}=%{{x}}"
+                                    "<br>超额收益=%{z:.2%}<extra></extra>"
+                                )))
         original = frame[frame.get("is_baseline", pd.Series(False, index=frame.index)) == True]
-        fig.add_trace(go.Scatter(x=original["slow"], y=original["fast"], mode="markers",
+        fig.add_trace(go.Scatter(x=original[column_key], y=original[row_key], mode="markers",
                                  marker={"symbol": "star", "size": 15, "color": "black"}, name="原始参数"))
-        fig.update_layout(xaxis_title="慢线周期（日）", yaxis_title="快线周期（日）")
+        unit = "" if row_key == "buy_threshold" else "（日）"
+        fig.update_layout(
+            xaxis_title=f"{column_label}{unit}",
+            yaxis_title=f"{row_label}{unit}",
+        )
     else:
         xcol = "slippage_bps" if kind == "cost" else "period"
         frame = frame.sort_values(xcol) if kind == "cost" else frame
@@ -160,4 +181,23 @@ class EvidenceTools:
             entry = self.pack["entries"][f"{self.pack['run_id']}:table:parameters"]
             return {"evidence_id": entry["id"], "rows": [r for r in entry["data"] if
                     r["fast"] == arguments["fast"] and r["slow"] == arguments["slow"]]}
+        if name == "get_breakout_parameter_cell" and set(arguments) == {
+            "entry_window", "exit_window"
+        }:
+            entry = self.pack["entries"][f"{self.pack['run_id']}:table:parameters"]
+            return {"evidence_id": entry["id"], "rows": [
+                r for r in entry["data"]
+                if r["entry_window"] == arguments["entry_window"]
+                and r["exit_window"] == arguments["exit_window"]
+            ]}
+        if name == "get_rsi_parameter_cell" and set(arguments) == {
+            "rsi_period", "buy_threshold", "sell_threshold"
+        }:
+            entry = self.pack["entries"][f"{self.pack['run_id']}:table:parameters"]
+            return {"evidence_id": entry["id"], "rows": [
+                row for row in entry["data"]
+                if row["rsi_period"] == arguments["rsi_period"]
+                and row["buy_threshold"] == arguments["buy_threshold"]
+                and row["sell_threshold"] == arguments["sell_threshold"]
+            ]}
         raise ValueError("未知工具或参数")

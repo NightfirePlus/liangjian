@@ -12,6 +12,8 @@ from core.schemas import StrategyConfig
 
 _TEMPLATE_NAMES = {
     "ma_cross": "双均线策略",
+    "breakout": "价格通道突破策略",
+    "rsi_reversion": "RSI 均值回归策略",
     "momentum_rotation": "动量轮动策略",
 }
 
@@ -32,6 +34,21 @@ def build_confirmation_text(config: StrategyConfig, overridden_defaults: list[st
     if config.template == "ma_cross":
         fast, slow = config.params.get("fast"), config.params.get("slow")
         lines.append(f"规则：{fast} 日均线上穿 {slow} 日均线买入，下穿卖出。")
+    elif config.template == "breakout":
+        entry = config.params.get("entry_window")
+        exit_ = config.params.get("exit_window")
+        lines.append(
+            f"规则：收盘价突破此前 {entry} 日最高价时买入，"
+            f"跌破此前 {exit_} 日最低价时卖出。"
+        )
+    elif config.template == "rsi_reversion":
+        period = config.params.get("rsi_period")
+        buy = config.params.get("buy_threshold")
+        sell = config.params.get("sell_threshold")
+        lines.append(
+            f"规则：计算 {period} 日 RSI，RSI 不高于 {buy} 时买入，"
+            f"不低于 {sell} 时卖出。"
+        )
     elif config.template == "momentum_rotation":
         lookback = config.params.get("lookback")
         top_n = config.params.get("top_n")

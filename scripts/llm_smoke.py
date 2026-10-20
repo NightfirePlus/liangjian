@@ -1,4 +1,4 @@
-"""检查 .env、OpenAI 兼容接口、自然语言解析和可选的证据报告调用。"""
+"""检查 .env、OpenAI 兼容接口、自然语言解析、证据报告和报告问答。"""
 from __future__ import annotations
 
 import argparse
@@ -12,7 +12,7 @@ sys.path.insert(0, str(ROOT))
 import config
 from core.nlp import parse_user_input
 from core.nlp.llm_client import complete_json
-from core.report import build_evidence, generate_report
+from core.report import answer_report_question, build_evidence, generate_report
 from core.schemas import ExperimentResult, ValidationReport
 
 
@@ -93,14 +93,20 @@ def run(*, include_report: bool) -> dict:
         "report": "skipped",
     }
     if include_report:
-        report = generate_report(_report_pack(), use_llm=True)
+        pack = _report_pack()
+        report = generate_report(pack, use_llm=True)
         if report["mode"] != "ai":
             raise RuntimeError(f"{report['notice']} {report.get('error', '')}".strip())
+        answer = answer_report_question("参数实验说明了什么？", pack, report, use_llm=True)
+        if answer["mode"] != "ai":
+            raise RuntimeError(f"报告问答未完成：{answer.get('error', '')}".strip())
         result["report"] = {
             "mode": report["mode"],
             "findings": len(report["findings"]),
             "dimensions": sorted({item["dimension"] for item in report["findings"]}),
             "tool_calls": len(report["tool_log"]),
+            "qa_mode": answer["mode"],
+            "qa_evidence": len(answer["evidence_refs"]),
         }
     return result
 

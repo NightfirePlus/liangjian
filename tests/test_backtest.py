@@ -138,6 +138,92 @@ def test_invalid_ma_parameters_are_rejected():
         run_backtest(prices, config)
 
 
+def test_breakout_signals_use_previous_channel_and_execute_next_open():
+    dates = pd.bdate_range("2024-01-01", periods=6)
+    close = [10.0, 10.0, 10.0, 11.0, 9.0, 9.0]
+    prices = pd.DataFrame({
+        "symbol": "510300",
+        "date": dates,
+        "open": [10.0, 10.0, 10.0, 11.0, 12.0, 8.0],
+        "high": [10.0, 10.0, 10.0, 11.0, 12.0, 9.0],
+        "low": [10.0, 10.0, 10.0, 11.0, 9.0, 8.0],
+        "close": close,
+        "volume": 1_000_000,
+    })
+    config = StrategyConfig(
+        template="breakout",
+        symbols=["510300"],
+        start="2024-01-01",
+        end="2024-01-31",
+        params={"entry_window": 3, "exit_window": 2},
+    )
+
+    trades, daily, metrics = run_backtest(prices, config)
+
+    assert trades["side"].tolist() == ["buy", "sell"]
+    assert trades["signal_date"].tolist() == [dates[3], dates[4]]
+    assert trades["exec_date"].tolist() == [dates[4], dates[5]]
+    assert trades["price"].tolist() == [12.0, 8.0]
+    assert trades["rule_trigger"].tolist() == [
+        "close_breaks_3d_high", "close_breaks_2d_low",
+    ]
+    assert not daily.empty
+    assert metrics.n_trades == 2
+
+
+def test_invalid_breakout_parameters_are_rejected():
+    prices = make_synthetic_prices("510300", "2024-01-01", "2024-12-31", seed=7)
+    config = StrategyConfig(
+        template="breakout",
+        symbols=["510300"],
+        start="2024-01-01",
+        end="2024-12-31",
+        params={"entry_window": 10, "exit_window": 20},
+    )
+
+    import pytest
+    with pytest.raises(ValueError, match="突破周期必须大于退出周期"):
+        run_backtest(prices, config)
+
+
+def test_rsi_reversion_runs_and_executes_on_next_open():
+    dates = pd.bdate_range("2024-01-01", periods=20)
+    close = [100, 102, 104, 106, 103, 100, 97, 94, 91, 94,
+             97, 100, 103, 106, 109, 106, 103, 100, 97, 94]
+    prices = pd.DataFrame({
+        "symbol": "510300", "date": dates, "open": close,
+        "high": [value + 1 for value in close],
+        "low": [value - 1 for value in close],
+        "close": close, "volume": 1_000_000,
+    })
+    config = StrategyConfig(
+        template="rsi_reversion", symbols=["510300"],
+        start="2024-01-01", end="2024-02-28",
+        params={"rsi_period": 3, "buy_threshold": 30, "sell_threshold": 70},
+    )
+
+    trades, daily, metrics = run_backtest(prices, config)
+
+    assert not trades.empty
+    assert trades.iloc[0]["side"] == "buy"
+    assert (trades["exec_date"] > trades["signal_date"]).all()
+    assert trades["rule_trigger"].str.startswith("rsi3_").all()
+    assert not daily.empty and metrics.n_trades == len(trades)
+
+
+def test_invalid_rsi_thresholds_are_rejected():
+    prices = make_synthetic_prices("510300", "2024-01-01", "2024-12-31", seed=8)
+    config = StrategyConfig(
+        template="rsi_reversion", symbols=["510300"],
+        start="2024-01-01", end="2024-12-31",
+        params={"rsi_period": 14, "buy_threshold": 80, "sell_threshold": 20},
+    )
+
+    import pytest
+    with pytest.raises(ValueError, match="RSI 阈值必须满足"):
+        run_backtest(prices, config)
+
+
 if __name__ == "__main__":
     test_ma_cross_runs_end_to_end()
     test_short_history_skips_annualization()

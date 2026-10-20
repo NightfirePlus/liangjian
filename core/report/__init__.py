@@ -2,5 +2,9 @@
 from core.report.evidence import build_evidence, chart_for
 from core.report.analysis import generate_report
 from core.report.export import export_bundle
+from core.report.qa import answer_report_question, format_report_answer
 
-__all__ = ["build_evidence", "chart_for", "generate_report", "export_bundle"]
+__all__ = [
+    "answer_report_question", "build_evidence", "chart_for", "export_bundle",
+    "format_report_answer", "generate_report",
+]

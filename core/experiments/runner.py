@@ -34,8 +34,10 @@ def resolve_experiment_spec(spec: ExperimentSpec, config: StrategyConfig) -> Exp
     三类实验使用各自固定、可解释的 v1 规则。后续若要支持用户自定义阈值，
     应扩展结构化契约，而不是执行任意表达式。
     """
-    if config.template != "ma_cross":
-        raise NotImplementedError("验证实验当前只支持已实现回测的 ma_cross 模板")
+    if config.template not in {"ma_cross", "breakout", "rsi_reversion"}:
+        raise NotImplementedError(
+            f"验证实验暂不支持策略模板 {config.template!r}"
+        )
 
     metric = _METRIC_ALIASES.get(spec.metric, spec.metric or "excess_return")
     if metric not in _SUPPORTED_METRICS:
@@ -217,6 +219,18 @@ def _default_grid(kind: str, config: StrategyConfig) -> dict:
         values = {0.0, 1.0, 2.0, 5.0, 10.0, float(config.cost.slippage_bps)}
         return {"slippage_bps": sorted(values)}
     if kind == "param_neighborhood":
+        if config.template == "breakout":
+            entry = int(config.params.get("entry_window", 20))
+            exit_ = int(config.params.get("exit_window", 10))
+            entry_values = sorted({max(exit_ + 1, entry - 5), entry, entry + 5})
+            exit_values = sorted({max(1, exit_ - 2), exit_, exit_ + 2})
+            return {"entry_window": entry_values, "exit_window": exit_values}
+        if config.template == "rsi_reversion":
+            buy = float(config.params.get("buy_threshold", 30))
+            sell = float(config.params.get("sell_threshold", 70))
+            buy_values = sorted({max(1.0, buy - 5), buy, min(98.0, buy + 5)})
+            sell_values = sorted({max(2.0, sell - 5), sell, min(99.0, sell + 5)})
+            return {"buy_threshold": buy_values, "sell_threshold": sell_values}
         fast = int(config.params.get("fast", 5))
         slow = int(config.params.get("slow", 20))
         fast_values = sorted({max(1, fast - 2), fast, fast + 2})
@@ -276,6 +290,15 @@ def _run_param_neighborhood(
     spec: ExperimentSpec,
     benchmark_prices: pd.DataFrame | None,
 ) -> list[dict]:
+    if config.template == "breakout":
+        return _run_breakout_param_neighborhood(
+            prices, config, spec, benchmark_prices
+        )
+    if config.template == "rsi_reversion":
+        return _run_rsi_param_neighborhood(
+            prices, config, spec, benchmark_prices
+        )
+
     fast_values = spec.grid.get("fast")
     slow_values = spec.grid.get("slow")
     if not isinstance(fast_values, list) or not fast_values:
@@ -306,6 +329,101 @@ def _run_param_neighborhood(
             ))
     if not rows:
         raise ValueError("参数邻域没有合法的 fast/slow 组合")
+    return rows
+
+
+def _run_breakout_param_neighborhood(
+    prices: pd.DataFrame,
+    config: StrategyConfig,
+    spec: ExperimentSpec,
+    benchmark_prices: pd.DataFrame | None,
+) -> list[dict]:
+    entry_values = spec.grid.get("entry_window")
+    exit_values = spec.grid.get("exit_window")
+    if not isinstance(entry_values, list) or not entry_values:
+        raise ValueError("param_neighborhood.grid.entry_window 必须是非空列表")
+    if not isinstance(exit_values, list) or not exit_values:
+        raise ValueError("param_neighborhood.grid.exit_window 必须是非空列表")
+
+    baseline_entry = int(config.params.get("entry_window", 20))
+    baseline_exit = int(config.params.get("exit_window", 10))
+    rows: list[dict] = []
+    for entry_value in entry_values:
+        for exit_value in exit_values:
+            entry, exit_ = int(entry_value), int(exit_value)
+            if entry <= 0 or exit_ <= 0 or entry <= exit_:
+                continue
+            point_config = replace(
+                config,
+                params={
+                    **config.params,
+                    "entry_window": entry,
+                    "exit_window": exit_,
+                },
+            )
+            rows.append(_run_point(
+                prices,
+                point_config,
+                spec.metric,
+                benchmark_prices,
+                {
+                    "entry_window": entry,
+                    "exit_window": exit_,
+                    "is_baseline": (
+                        entry == baseline_entry and exit_ == baseline_exit
+                    ),
+                },
+            ))
+    if not rows:
+        raise ValueError("参数邻域没有合法的 entry_window/exit_window 组合")
+    return rows
+
+
+def _run_rsi_param_neighborhood(
+    prices: pd.DataFrame,
+    config: StrategyConfig,
+    spec: ExperimentSpec,
+    benchmark_prices: pd.DataFrame | None,
+) -> list[dict]:
+    buy_values = spec.grid.get("buy_threshold")
+    sell_values = spec.grid.get("sell_threshold")
+    if not isinstance(buy_values, list) or not buy_values:
+        raise ValueError("param_neighborhood.grid.buy_threshold 必须是非空列表")
+    if not isinstance(sell_values, list) or not sell_values:
+        raise ValueError("param_neighborhood.grid.sell_threshold 必须是非空列表")
+
+    period = int(config.params.get("rsi_period", 14))
+    baseline_buy = float(config.params.get("buy_threshold", 30))
+    baseline_sell = float(config.params.get("sell_threshold", 70))
+    rows: list[dict] = []
+    for buy_value in buy_values:
+        for sell_value in sell_values:
+            buy, sell = float(buy_value), float(sell_value)
+            if period <= 0 or not 0 < buy < sell < 100:
+                continue
+            point_config = replace(
+                config,
+                params={
+                    **config.params,
+                    "rsi_period": period,
+                    "buy_threshold": buy,
+                    "sell_threshold": sell,
+                },
+            )
+            rows.append(_run_point(
+                prices,
+                point_config,
+                spec.metric,
+                benchmark_prices,
+                {
+                    "rsi_period": period,
+                    "buy_threshold": buy,
+                    "sell_threshold": sell,
+                    "is_baseline": buy == baseline_buy and sell == baseline_sell,
+                },
+            ))
+    if not rows:
+        raise ValueError("参数邻域没有合法的 RSI 买入/卖出阈值组合")
     return rows
 
 

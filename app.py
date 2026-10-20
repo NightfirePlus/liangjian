@@ -9,15 +9,59 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from config import APP_NAME, APP_TAGLINE, APP_VERSION, DISCLAIMER, LLM_AVAILABLE
+from core.agent import route_agent_message
 from core.backtest.engine import run_backtest_from_snapshot
 from core.data import ensure_market_snapshot, get_etf, list_snapshots, load_snapshot
 from core.experiments import run_validation_suite
+from core.finance import answer_finance_question
 from core.nlp import parse_user_input
-from core.report import build_evidence, chart_for, export_bundle, generate_report
+from core.report import (
+    answer_report_question, build_evidence, chart_for, export_bundle,
+    format_report_answer, generate_report,
+)
 from core.schemas import Metrics, ValidationReport
 from core.strategy import StrategyDraft, align_draft_to_available_period, specified_fields_from_candidate
 
 st.set_page_config(page_title=APP_NAME, page_icon="📈", layout="wide")
+
+st.markdown(
+    """
+    <style>
+    .stApp { background: #f7f8fa; }
+    [data-testid="stSidebar"] { background: #ffffff; border-right: 1px solid #e9edf2; }
+    [data-testid="stSidebar"] .stButton > button {
+      min-height: 2.85rem; border-radius: 14px; justify-content: flex-start;
+      padding: .65rem .85rem; border: 1px solid #e4e8ee; font-weight: 650;
+      box-shadow: none; transition: border-color .15s ease, background .15s ease;
+    }
+    [data-testid="stSidebar"] .stButton > button:hover {
+      border-color: #ff6b66; color: #c93f3b; background: #fff7f6;
+    }
+    [data-testid="stSidebar"] button[data-testid="stBaseButton-primary"] {
+      background: #fff1f0; color: #b93431; border-color: #ff6b66;
+    }
+    .block-container { max-width: 1180px; padding-top: 2.2rem; padding-bottom: 4rem; }
+    .qv-eyebrow { color: #e6534e; font-size: .82rem; font-weight: 700; letter-spacing: .08em; }
+    .qv-hero { padding: 2.2rem 2.4rem; border-radius: 22px; color: white;
+      background: linear-gradient(135deg, #17243a 0%, #263f63 68%, #375b82 100%);
+      box-shadow: 0 16px 42px rgba(24, 43, 70, .16); margin-bottom: 1.3rem; }
+    .qv-hero h1 { font-size: 2.5rem; line-height: 1.15; margin: .35rem 0 .8rem; }
+    .qv-hero p { max-width: 740px; color: #dce6f1; font-size: 1.06rem; margin: 0; }
+    .qv-step { color: #e6534e; font-weight: 750; font-size: .8rem; letter-spacing: .05em; }
+    .qv-card-title { font-size: 1.05rem; font-weight: 720; margin-bottom: .35rem; }
+    div[data-testid="stMetric"] { background: white; border: 1px solid #e7ebf0;
+      padding: .85rem 1rem; border-radius: 14px; }
+    div[data-testid="stChatMessage"] { background: white; border: 1px solid #e8ebef;
+      border-radius: 16px; padding: .25rem .55rem; }
+    div[data-testid="stVerticalBlockBorderWrapper"] { background: white; }
+    .qv-muted { color: #687385; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+_PAGES = ("首页", "使用文档", "量化策略验证", "AI 金融问答")
+_ANSWER_MODES = ("新手讲解", "简洁摘要", "技术细节")
 
 
 def _symbol_label(symbol: str) -> str:
@@ -84,7 +128,11 @@ def _render_validation_tables(report: ValidationReport) -> None:
         (
             "strategy_parameter_robustness",
             "策略参数稳健性",
-            ["fast", "slow", "is_baseline", "total_return", "excess_return", "n_trades", "error"],
+            [
+                "fast", "slow", "entry_window", "exit_window", "rsi_period",
+                "buy_threshold", "sell_threshold", "is_baseline",
+                "total_return", "excess_return", "n_trades", "error",
+            ],
         ),
         (
             "market_period_robustness",
@@ -112,6 +160,11 @@ _DRAFT_WIDGET_KEYS = {
     "end": "draft_end",
     "fast": "draft_fast",
     "slow": "draft_slow",
+    "entry_window": "draft_entry_window",
+    "exit_window": "draft_exit_window",
+    "rsi_period": "draft_rsi_period",
+    "buy_threshold": "draft_buy_threshold",
+    "sell_threshold": "draft_sell_threshold",
     "initial_cash": "draft_cash",
     "commission_bps": "draft_commission_bps",
     "min_commission": "draft_min_commission",
@@ -122,6 +175,7 @@ _DRAFT_WIDGET_KEYS = {
 def _clear_calculated_results() -> None:
     for key in ("confirmed_draft_hash", "backtest_result", "validation_result", "evidence_result"):
         st.session_state.pop(key, None)
+    st.session_state.pop("report_qa_history", None)
 
 
 def _clear_draft() -> None:
@@ -131,8 +185,36 @@ def _clear_draft() -> None:
     _clear_calculated_results()
 
 
-def _append_chat(role: str, content: str) -> None:
-    st.session_state.setdefault("strategy_chat", []).append({"role": role, "content": content})
+def _append_chat(role: str, content: str, *, evidence_refs: list[str] | None = None) -> None:
+    message = {"role": role, "content": content}
+    if evidence_refs:
+        message["evidence_refs"] = list(dict.fromkeys(evidence_refs))
+    st.session_state.setdefault("strategy_chat", []).append(message)
+
+
+def _render_chat_evidence(message: dict, message_index: int) -> None:
+    refs = message.get("evidence_refs") or []
+    stored = st.session_state.get("evidence_result")
+    if not refs or not stored:
+        return
+    pack = stored.get("pack") or {}
+    entries = pack.get("entries") or {}
+    valid_refs = [evidence_id for evidence_id in refs if evidence_id in entries]
+    if not valid_refs:
+        return
+    with st.expander(f"查看证据附件（{len(valid_refs)}）"):
+        for evidence_index, evidence_id in enumerate(valid_refs):
+            entry = entries[evidence_id]
+            st.markdown(f"**{entry['title']}**  \n`{evidence_id}`")
+            if entry["kind"] == "chart":
+                st.plotly_chart(
+                    chart_for(pack, evidence_id), width="stretch",
+                    key=f"chat_evidence_{message_index}_{evidence_index}",
+                )
+            elif entry["kind"] == "table":
+                st.dataframe(pd.DataFrame(entry["data"]), width="stretch", hide_index=True)
+            else:
+                st.json(entry["data"])
 
 
 def _symbol_period(prices: pd.DataFrame, symbol: str) -> tuple[str, str]:
@@ -142,6 +224,25 @@ def _symbol_period(prices: pd.DataFrame, symbol: str) -> tuple[str, str]:
     return (
         str(pd.Timestamp(symbol_prices["date"].min()).date()),
         str(pd.Timestamp(symbol_prices["date"].max()).date()),
+    )
+
+
+def _snapshot_covers_request(
+    prices: pd.DataFrame,
+    symbol: str,
+    requested_start: str,
+    requested_end: str,
+    *,
+    tolerance_days: int = 10,
+) -> bool:
+    """判断当前已选快照能否覆盖请求；周末和节假日允许少量边界偏差。"""
+    symbol_prices = prices[prices["symbol"] == symbol]
+    if symbol_prices.empty:
+        return False
+    tolerance = pd.Timedelta(days=tolerance_days)
+    return bool(
+        symbol_prices["date"].min() <= pd.Timestamp(requested_start) + tolerance
+        and symbol_prices["date"].max() >= pd.Timestamp(requested_end) - tolerance
     )
 
 
@@ -165,6 +266,11 @@ def _sync_draft_widgets(draft: StrategyDraft) -> None:
         "end": pd.Timestamp(draft.end).date(),
         "fast": draft.fast,
         "slow": draft.slow,
+        "entry_window": draft.entry_window,
+        "exit_window": draft.exit_window,
+        "rsi_period": draft.rsi_period,
+        "buy_threshold": draft.buy_threshold,
+        "sell_threshold": draft.sell_threshold,
         "initial_cash": draft.initial_cash,
         "commission_bps": draft.commission_rate * 10_000,
         "min_commission": draft.min_commission,
@@ -197,9 +303,324 @@ def _origin_label(origin: str) -> str:
     }.get(origin, origin)
 
 
-# 侧栏只放环境与快捷入口，主页面保持为一个连续的 Agent 对话。
-st.sidebar.title(APP_NAME)
+def _current_report_ready(snapshot_id: str) -> bool:
+    draft = st.session_state.get("strategy_draft")
+    evidence = st.session_state.get("evidence_result")
+    if draft is None or not evidence:
+        return False
+    try:
+        return evidence.get("key") == draft.execution_hash(snapshot_id)
+    except ValueError:
+        return False
+
+
+def _navigate(page: str) -> None:
+    st.session_state["main_nav"] = page
+
+
+def _set_session_choice(key: str, value: str) -> None:
+    st.session_state[key] = value
+
+
+def _sidebar_cards(
+    title: str,
+    options: tuple[str, ...],
+    *,
+    state_key: str,
+    icons: tuple[str, ...],
+) -> str:
+    """用整块圆角按钮呈现侧栏选择，避免单选圆点的表单感。"""
+    current = st.session_state.get(state_key)
+    if current not in options:
+        current = options[0]
+        st.session_state[state_key] = current
+    st.sidebar.markdown(f"**{title}**")
+    for option, icon in zip(options, icons):
+        st.sidebar.button(
+            f"{icon}　{option}",
+            key=f"{state_key}_{option}",
+            type="primary" if option == current else "secondary",
+            use_container_width=True,
+            on_click=_set_session_choice,
+            args=(state_key, option),
+        )
+    return current
+
+
+def _seed_verification(template: str) -> None:
+    st.session_state["verification_seed_template"] = template
+    st.session_state["main_nav"] = "量化策略验证"
+
+
+def _render_home() -> None:
+    st.markdown(
+        """
+        <div class="qv-hero">
+          <div class="qv-eyebrow">QUANT IDEAS, EXPLAINED</div>
+          <h1>把一句投资想法，变成一次看得懂的历史验证</h1>
+          <p>量见会和你澄清规则、准备行情、执行回测与稳健性实验，最后用 AI 生成每条结论都有证据的报告。</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    action_col, guide_col, spacer = st.columns([1.15, 1.15, 2.7])
+    action_col.button(
+        "开始验证我的想法", type="primary", use_container_width=True,
+        on_click=_navigate, args=("量化策略验证",),
+    )
+    guide_col.button(
+        "先看使用方法", use_container_width=True,
+        on_click=_navigate, args=("使用文档",),
+    )
+
+    st.markdown("### 你会得到什么")
+    metric_cols = st.columns(4)
+    for column, title, value, detail in zip(
+        metric_cols,
+        ("可执行策略", "验证实验", "行情处理", "结论证据"),
+        ("3 种", "3 类", "自动", "逐条绑定"),
+        (
+            "趋势与均值回归", "参数、成本与时段", "缓存优先，缺失时获取",
+            "图表、表格与原始指标",
+        ),
+    ):
+        with column.container(border=True):
+            st.caption(title)
+            st.markdown(f"### {value}")
+            st.caption(detail)
+
+    st.markdown("### 一次验证怎样完成")
+    for index, (title, body) in enumerate((
+        ("说出想法", "不用写代码。描述想买什么、什么情况下买卖，条件不完整时 Agent 会继续追问。"),
+        ("确认规则", "系统把想法整理成可编辑草案，买卖条件、区间、资金和成本都由你确认。"),
+        ("运行实验", "固定本次行情数据，执行原策略回测、成本敏感性、参数邻域和分时段实验。"),
+        ("阅读报告", "先看收益和风险，再看热力图、对比图与 AI 结论；每条结论都能展开证据。"),
+    ), start=1):
+        with st.container(border=True):
+            step_col, text_col = st.columns([0.55, 5])
+            step_col.markdown(f"<div class='qv-step'>步骤 {index}</div>", unsafe_allow_html=True)
+            text_col.markdown(f"**{title}**  \n{body}")
+
+    st.markdown("### 当前可直接验证的策略")
+    strategy_col1, strategy_col2, strategy_col3 = st.columns(3)
+    with strategy_col1.container(border=True):
+        st.markdown("#### 双均线交叉")
+        st.write("短期均线上穿长期均线时买入，下穿时卖出。适合用来理解趋势跟随和震荡损耗。")
+        st.caption("需要选择：快线周期、慢线周期、交易标的和测试区间。")
+        st.button(
+            "用双均线开始", key="home_ma", use_container_width=True,
+            on_click=_seed_verification, args=("ma_cross",),
+        )
+    with strategy_col2.container(border=True):
+        st.markdown("#### 价格通道突破")
+        st.write("突破过去一段时间的最高价时买入，跌破较短周期最低价时退出。")
+        st.caption("需要选择：突破周期、退出周期、交易标的和测试区间。")
+        st.button(
+            "用价格突破开始", key="home_breakout", use_container_width=True,
+            on_click=_seed_verification, args=("breakout",),
+        )
+    with strategy_col3.container(border=True):
+        st.markdown("#### RSI 均值回归")
+        st.write("RSI 进入超卖区时买入，进入超买区时卖出，用来测试价格向常态回归的想法。")
+        st.caption("需要选择：RSI 周期、买入阈值、卖出阈值、标的和区间。")
+        st.button(
+            "用 RSI 开始", key="home_rsi", use_container_width=True,
+            on_click=_seed_verification, args=("rsi_reversion",),
+        )
+
+    st.markdown("### 报告不会只给一个分数")
+    sample_left, sample_right = st.columns([1.15, 1])
+    with sample_left.container(border=True):
+        st.caption("报告版式示意 · 非真实实验结果")
+        st.markdown("#### 历史表现预览")
+        st.write("原始策略的收益、最大回撤和相对基准表现会分开呈现。")
+        sample_metrics = st.columns(3)
+        sample_metrics[0].metric("策略收益", "12.4%")
+        sample_metrics[1].metric("最大回撤", "-8.7%")
+        sample_metrics[2].metric("超额收益", "+1.9%")
+        st.caption("这些数字只用于展示报告布局，不来自任何策略或行情。")
+    with sample_right.container(border=True):
+        st.markdown("#### 每条结论附带")
+        st.write("✓ 本次实验中的具体指标")
+        st.write("✓ 对应热力图、对比图或数据表")
+        st.write("✓ 数据范围和结论局限")
+        st.write("✓ 可下载的完整证据包")
+
+    st.info("当前不做实时选股、自动交易或新闻因果归因。历史回测用于理解策略规则和风险，不预测未来。")
+
+
+def _render_docs() -> None:
+    st.markdown("<div class='qv-eyebrow'>GUIDE</div>", unsafe_allow_html=True)
+    st.title("使用文档")
+    st.caption("从第一次输入到读懂报告，所有默认设置和修改影响都集中在这里。")
+    st.button(
+        "进入量化策略验证", type="primary",
+        on_click=_navigate, args=("量化策略验证",),
+    )
+
+    quick_tab, strategy_tab, defaults_tab, report_tab, ai_tab = st.tabs([
+        "快速入门", "策略规则", "默认值", "怎样看报告", "AI 回答方式",
+    ])
+    with quick_tab:
+        st.markdown("### 从一句话开始")
+        st.code("用沪深300ETF测试双均线，5日线上穿20日线买入，回测近两年。", language=None)
+        st.markdown(
+            """
+1. 在“量化策略验证”中输入想法，也可以从侧栏典型策略开始。
+2. Agent 会追问无法执行的缺失条件，并生成策略确认卡。
+3. 检查买卖规则、日期、标的、资金与成本，然后点击确认。
+4. 点击“开始验证并生成报告”，等待回测、实验和报告完成。
+5. 在报告区查看表现、图表、结论和数据，也可以在对话中继续追问。
+            """
+        )
+        st.warning("确认卡里的规则就是实际执行规则。只修改聊天文字不会绕过确认。")
+    with strategy_tab:
+        st.markdown("### 双均线交叉")
+        st.write("快线反映较近的平均价格，慢线反映较长趋势。快线上穿慢线买入，下穿卖出。")
+        st.dataframe(pd.DataFrame([
+            {"参数": "快线周期", "含义": "短期平均价格使用的交易日数", "要求": "正整数且小于慢线"},
+            {"参数": "慢线周期", "含义": "长期平均价格使用的交易日数", "要求": "正整数且大于快线"},
+        ]), hide_index=True, width="stretch")
+        st.markdown("### 价格通道突破")
+        st.write("收盘价超过此前突破周期内的最高价时买入，低于此前退出周期内的最低价时卖出。")
+        st.dataframe(pd.DataFrame([
+            {"参数": "突破周期", "含义": "判断向上突破所看的历史长度", "要求": "大于退出周期"},
+            {"参数": "退出周期", "含义": "判断趋势转弱所看的历史长度", "要求": "正整数"},
+        ]), hide_index=True, width="stretch")
+        st.markdown("### RSI 均值回归")
+        st.write("RSI 进入超卖区域时买入，进入超买区域时卖出，尝试捕捉价格向常态回归的过程。")
+        st.dataframe(pd.DataFrame([
+            {"参数": "RSI 周期", "含义": "计算近期上涨和下跌强弱所用的交易日数", "要求": "正整数"},
+            {"参数": "买入阈值", "含义": "RSI 不高于该值时形成买入信号", "要求": "大于零且小于卖出阈值"},
+            {"参数": "卖出阈值", "含义": "RSI 不低于该值时形成卖出信号", "要求": "大于买入阈值且小于一百"},
+        ]), hide_index=True, width="stretch")
+        st.info("三种策略都在当日收盘后形成信号，于下一交易日开盘执行，避免使用尚未出现的信息。")
+    with defaults_tab:
+        st.markdown("### 当前执行默认值")
+        st.dataframe(pd.DataFrame([
+            {"设置": "初始资金", "默认值": "100,000 元", "修改后影响": "持仓规模和最低佣金影响"},
+            {"设置": "成交时点", "默认值": "信号次日开盘", "修改后影响": "当前固定，不可修改"},
+            {"设置": "复权口径", "默认值": "前复权", "修改后影响": "当前由数据层固定"},
+            {"设置": "仓位", "默认值": "单标的满仓、仅多头", "修改后影响": "当前固定，不可修改"},
+            {"设置": "单边佣金", "默认值": "0.01%", "修改后影响": "改变每次成交成本"},
+            {"设置": "最低佣金", "默认值": "0 元", "修改后影响": "小额交易受影响更明显"},
+            {"设置": "单边滑点", "默认值": "1 bps", "修改后影响": "成交越频繁，累计影响通常越大"},
+            {"设置": "比较基准", "默认值": "同一标的买入持有", "修改后影响": "改变超额收益的比较对象"},
+        ]), hide_index=True, width="stretch")
+        st.caption("资金、佣金、最低佣金、滑点和比较基准可在确认卡的折叠设置中修改。")
+    with report_tab:
+        st.markdown("### 建议阅读顺序")
+        st.markdown(
+            """
+1. **总收益和基准收益**：策略是否赚钱，以及是否优于简单买入持有。
+2. **最大回撤**：历史上从高点跌到低点最严重的一段。
+3. **参数热力图**：结果是否只依赖一个特殊参数组合。
+4. **成本敏感性**：滑点提高后，历史结果是否明显恶化。
+5. **分时段比较**：不同历史阶段的结果是否一致。
+6. **结论附件**：展开表格和图表，确认 AI 的解释来自本次实验。
+            """
+        )
+        st.error("正收益比例不是未来成功概率；历史表现、参数邻域和分时段实验都不构成统计证明。")
+    with ai_tab:
+        st.markdown("### 回答方式")
+        st.write("侧栏可以随时切换，设置会用于 AI 金融问答；实验事实和证据不会随表达方式变化。")
+        st.dataframe(pd.DataFrame([
+            {"模式": "新手讲解", "适合": "第一次接触量化", "表达": "解释术语并给简短例子"},
+            {"模式": "简洁摘要", "适合": "快速查看答案", "表达": "只保留关键结论和限制"},
+            {"模式": "技术细节", "适合": "希望了解计算口径", "表达": "增加公式、统计和实现细节"},
+        ]), hide_index=True, width="stretch")
+        st.info("AI 金融问答目前只讲基础概念和常见策略，不查询实时价格或新闻，也不提供个性化投资建议。")
+
+
+def _render_finance_qa(answer_mode: str) -> None:
+    st.markdown("<div class='qv-eyebrow'>LEARN</div>", unsafe_allow_html=True)
+    st.title("AI 金融问答")
+    st.caption("先理解概念，再决定是否把一个受支持的策略带入历史验证。")
+    if not LLM_AVAILABLE:
+        st.info("模型尚未配置，当前使用本地基础知识回答常见概念。")
+
+    st.markdown("### 可以这样问")
+    quick_cols = st.columns(3)
+    quick_prompts = (
+        "什么是量化投资？",
+        "最大回撤是什么意思？",
+        "双均线策略有什么局限？",
+        "价格突破策略怎样运行？",
+        "RSI 超买超卖是什么意思？",
+    )
+    selected_question = None
+    for index, prompt in enumerate(quick_prompts):
+        if quick_cols[index % 3].button(prompt, key=f"finance_quick_{index}", use_container_width=True):
+            selected_question = prompt
+
+    typed_question = st.chat_input("问一个量化或回测相关问题……", key="finance_chat_input")
+    question = (typed_question or selected_question or "").strip()
+    history = st.session_state.setdefault("finance_chat", [])
+    if question:
+        history.append({"role": "user", "content": question})
+        with st.spinner("正在整理这个概念……"):
+            answer = answer_finance_question(
+                question, mode=answer_mode, history=history, use_llm=LLM_AVAILABLE,
+            )
+        history.append({"role": "assistant", **answer})
+        st.rerun()
+
+    if not history:
+        with st.chat_message("assistant"):
+            st.write("你好，我可以解释量化、回测、收益与风险指标，以及常见策略怎样运行。")
+            st.caption("涉及当前报告的具体问题，请回到“量化策略验证”，在报告完成后的对话里提问。")
+    for index, message in enumerate(history):
+        with st.chat_message(message["role"]):
+            st.write(message.get("content") or message.get("answer"))
+            if message["role"] == "assistant":
+                concepts = message.get("related_concepts") or []
+                if concepts:
+                    st.caption("相关概念：" + " · ".join(concepts))
+                st.caption("AI 解释" if message.get("source") == "ai" else "本地基础知识")
+                suggested = message.get("suggested_strategy")
+                if suggested:
+                    label = {
+                        "ma_cross": "用双均线创建验证草案",
+                        "breakout": "用价格突破创建验证草案",
+                        "rsi_reversion": "用 RSI 创建验证草案",
+                    }[suggested]
+                    st.button(
+                        label, key=f"finance_seed_{index}", type="primary",
+                        on_click=_seed_verification, args=(suggested,),
+                    )
+    st.caption(DISCLAIMER)
+
+
+# 四个模块共用同一套导航和回答偏好；验证工作台在下方继续渲染。
+st.sidebar.markdown(f"## {APP_NAME}")
 st.sidebar.caption(f"{APP_TAGLINE} · {APP_VERSION}")
+page = _sidebar_cards(
+    "功能模块", _PAGES, state_key="main_nav",
+    icons=("⌂", "▤", "◆", "✦"),
+)
+st.sidebar.divider()
+answer_mode = _sidebar_cards(
+    "AI 回答方式", _ANSWER_MODES, state_key="answer_mode",
+    icons=("○", "◇", "□"),
+)
+st.sidebar.caption("回答方式不会修改回测结果。")
+
+if page == "首页":
+    _render_home()
+    st.caption(DISCLAIMER)
+    st.stop()
+if page == "使用文档":
+    _render_docs()
+    st.caption(DISCLAIMER)
+    st.stop()
+if page == "AI 金融问答":
+    _render_finance_qa(answer_mode)
+    st.stop()
+
+
+# 侧栏在验证模块中继续显示实验环境与快捷入口。
+st.sidebar.divider()
+st.sidebar.markdown("### 验证工作台")
 st.sidebar.header("验证环境")
 snapshots = list_snapshots()
 if not snapshots:
@@ -207,6 +628,14 @@ if not snapshots:
     st.stop()
 
 snapshot_by_id = {meta.snapshot_id: meta for meta in snapshots}
+snapshot_options = sorted(
+    snapshot_by_id,
+    key=lambda sid: (
+        snapshot_by_id[sid].is_synthetic,
+        -pd.Timestamp(snapshot_by_id[sid].actual_end).value,
+        sid,
+    ),
+)
 pending_snapshot_id = st.session_state.pop("_pending_snapshot_id", None)
 if pending_snapshot_id in snapshot_by_id:
     st.session_state["selected_snapshot_id"] = pending_snapshot_id
@@ -214,7 +643,7 @@ elif st.session_state.get("selected_snapshot_id") not in snapshot_by_id:
     st.session_state.pop("selected_snapshot_id", None)
 snapshot_id = st.sidebar.selectbox(
     "当前实验数据",
-    options=list(snapshot_by_id),
+    options=snapshot_options,
     key="selected_snapshot_id",
     format_func=lambda sid: (
         f"{snapshot_by_id[sid].actual_start} 至 {snapshot_by_id[sid].actual_end}"
@@ -240,13 +669,35 @@ if st.session_state.get("draft_snapshot_id") != snapshot_id:
     _clear_draft()
     st.session_state["draft_snapshot_id"] = snapshot_id
     st.session_state["strategy_chat"] = []
+    st.session_state["strategy_input_history"] = []
+    st.session_state["report_qa_history"] = []
     for key in list(st.session_state):
         if key.startswith("quick_"):
             st.session_state.pop(key, None)
 
+seed_template = st.session_state.pop("verification_seed_template", None)
+if seed_template in {"ma_cross", "breakout", "rsi_reversion"}:
+    seeded = _default_draft(snapshot_meta, prices)
+    seeded.template = seed_template
+    seeded.origin = "preset"
+    seeded.specified_fields = ["推荐策略模板"]
+    st.session_state["strategy_input_history"] = []
+    _install_draft(seeded, snapshot_id)
+    strategy_name = {
+        "ma_cross": "双均线",
+        "breakout": "价格通道突破",
+        "rsi_reversion": "RSI 均值回归",
+    }[seed_template]
+    _append_chat(
+        "assistant",
+        f"我已从上一页带入{strategy_name}草案。请在确认卡中检查参数、标的和测试区间。",
+    )
+
 if st.sidebar.button("新建对话", use_container_width=True):
     _clear_draft()
     st.session_state["strategy_chat"] = []
+    st.session_state["strategy_input_history"] = []
+    st.session_state["report_qa_history"] = []
     st.rerun()
 
 st.sidebar.header("快捷创建")
@@ -261,12 +712,56 @@ for label, preset_fast, preset_slow in (
         preset = _default_draft(snapshot_meta, prices)
         preset.fast, preset.slow, preset.origin = preset_fast, preset_slow, "preset"
         preset.specified_fields = ["典型策略模板"]
+        st.session_state["strategy_input_history"] = []
         _install_draft(preset, snapshot_id)
         _append_chat("assistant", f"我已载入 {label} 的典型双均线草案，请在对话中检查并确认。")
         st.rerun()
 
+st.sidebar.markdown("**典型价格突破**")
+for label, preset_entry, preset_exit in (
+    ("20日突破 / 10日退出", 20, 10),
+    ("55日突破 / 20日退出", 55, 20),
+):
+    if st.sidebar.button(
+        label,
+        key=f"preset_breakout_{preset_entry}_{preset_exit}",
+        use_container_width=True,
+    ):
+        preset = _default_draft(snapshot_meta, prices)
+        preset.template = "breakout"
+        preset.entry_window = preset_entry
+        preset.exit_window = preset_exit
+        preset.origin = "preset"
+        preset.specified_fields = ["典型策略模板"]
+        st.session_state["strategy_input_history"] = []
+        _install_draft(preset, snapshot_id)
+        _append_chat("assistant", f"我已载入 {label} 的价格突破草案，请在对话中检查并确认。")
+        st.rerun()
+
+st.sidebar.markdown("**典型 RSI 均值回归**")
+for label, preset_period, preset_buy, preset_sell in (
+    ("14日 RSI / 30买入 / 70卖出", 14, 30, 70),
+    ("10日 RSI / 25买入 / 75卖出", 10, 25, 75),
+):
+    if st.sidebar.button(
+        label,
+        key=f"preset_rsi_{preset_period}_{preset_buy}_{preset_sell}",
+        use_container_width=True,
+    ):
+        preset = _default_draft(snapshot_meta, prices)
+        preset.template = "rsi_reversion"
+        preset.rsi_period = preset_period
+        preset.buy_threshold = preset_buy
+        preset.sell_threshold = preset_sell
+        preset.origin = "preset"
+        preset.specified_fields = ["典型策略模板"]
+        st.session_state["strategy_input_history"] = []
+        _install_draft(preset, snapshot_id)
+        _append_chat("assistant", f"我已载入 {label} 的 RSI 草案，请在对话中检查并确认。")
+        st.rerun()
+
 with st.sidebar.form("quick_strategy_form"):
-    st.markdown("**按选项创建**")
+    st.markdown("**按选项创建双均线**")
     quick_symbol = st.selectbox(
         "交易标的", snapshot_meta.symbols, format_func=_symbol_label, key="quick_symbol",
         help="策略实际买卖的 ETF。",
@@ -334,6 +829,7 @@ if quick_submitted:
         if quick_issues:
             st.sidebar.error("；".join(quick_issues))
         else:
+            st.session_state["strategy_input_history"] = []
             _install_draft(quick_draft, snapshot_id)
             _append_chat(
                 "assistant", data_reply + "\n\n我已根据侧栏选项生成策略草案，请检查并确认。",
@@ -346,18 +842,49 @@ with st.sidebar.expander("参数是什么意思？"):
     st.write("**快线**：较短时间的平均价格，对近期变化更敏感。")
     st.write("**慢线**：较长时间的平均价格，用来表示长期趋势。")
     st.write("**上穿**：快线从慢线下方移动到上方。")
+    st.write("**突破周期**：用过去一段时间的最高价判断是否向上突破。")
+    st.write("**退出周期**：用较短区间的最低价判断何时退出持仓。")
+    st.write("**RSI 周期**：计算近期上涨和下跌强弱时使用的交易日数。")
+    st.write("**超卖/超买阈值**：RSI 到达买入或卖出区域的边界。")
     st.write("**比较基准**：用来比较策略是否优于直接买入并持有。")
 
 
 # chat_input 固定显示在页面底部，但先处理输入，确保新草案在本轮渲染前同步到编辑控件。
 idea_text = st.chat_input(
-    "告诉我你的策略想法，也可以继续补充或修改……",
+    "询问这份报告，或明确告诉我如何修改策略……"
+    if _current_report_ready(snapshot_id)
+    else "告诉我你的策略想法，也可以继续补充或修改……",
+    key="agent_chat_input",
     disabled=quality_report.has_error,
 )
 if idea_text and idea_text.strip():
+    report_ready = _current_report_ready(snapshot_id)
+    intent = route_agent_message(idea_text, report_ready=report_ready)
+    if intent == "report_question":
+        _append_chat("user", idea_text.strip())
+        evidence_stored = st.session_state["evidence_result"]
+        pack = evidence_stored["pack"]
+        report = evidence_stored["analysis"]
+        history = st.session_state.setdefault("report_qa_history", [])
+        with st.spinner("正在查阅本次实验的指标、图表和证据……"):
+            answer = answer_report_question(
+                idea_text.strip(), pack, report,
+                history=history, answer_mode=answer_mode, use_llm=LLM_AVAILABLE,
+            )
+        history.append({
+            "question": idea_text.strip(),
+            "answer": answer["answer"],
+            "evidence_refs": answer["evidence_refs"],
+        })
+        _append_chat(
+            "assistant", format_report_answer(answer, pack),
+            evidence_refs=answer["evidence_refs"],
+        )
+        st.rerun()
     _append_chat("user", idea_text.strip())
-    messages = st.session_state["strategy_chat"]
-    combined_text = "\n".join(message["content"] for message in messages if message["role"] == "user")
+    strategy_inputs = st.session_state.setdefault("strategy_input_history", [])
+    strategy_inputs.append(idea_text.strip())
+    combined_text = "\n".join(strategy_inputs)
     with st.spinner("正在理解你的想法……"):
         parsed = parse_user_input(combined_text, reference_end=date.today().isoformat())
     if parsed.needs_clarification:
@@ -382,20 +909,31 @@ if idea_text and idea_text.strip():
                     f"“近 {relative_years} 年”按当前日期 "
                     f"{parsed.raw_candidate['_relative_period_reference_end']} 计算。"
                 )
+            use_selected_snapshot = _snapshot_covers_request(
+                prices, parsed_draft.symbol, parsed_draft.start, parsed_draft.end,
+            )
             with st.spinner("正在检查本地行情，缺失时将从外部接口获取……"):
-                resolved_meta, resolved_quality, cache_hit = ensure_market_snapshot(
-                    [parsed_draft.symbol], parsed_draft.start, parsed_draft.end,
-                )
+                if use_selected_snapshot:
+                    resolved_meta, resolved_quality, cache_hit = (
+                        snapshot_meta, quality_report, True
+                    )
+                else:
+                    resolved_meta, resolved_quality, cache_hit = ensure_market_snapshot(
+                        [parsed_draft.symbol], parsed_draft.start, parsed_draft.end,
+                    )
             if resolved_quality.has_error:
                 raise RuntimeError("获取到的行情未通过数据质量检查")
             resolved_prices, resolved_meta, resolved_quality = load_snapshot(
                 resolved_meta.snapshot_id,
             )
-            data_reply = (
-                f"已复用本地真实行情缓存 `{resolved_meta.snapshot_id}`。"
-                if cache_hit else
-                f"本地没有覆盖该区间的真实行情，已通过 {resolved_meta.source} 获取并缓存。"
-            )
+            if use_selected_snapshot:
+                data_reply = f"当前实验数据 `{resolved_meta.snapshot_id}` 已覆盖该区间。"
+            else:
+                data_reply = (
+                    f"已复用本地真实行情缓存 `{resolved_meta.snapshot_id}`。"
+                    if cache_hit else
+                    f"本地没有覆盖该区间的真实行情，已通过 {resolved_meta.source} 获取并缓存。"
+                )
             if resolved_meta.snapshot_id != snapshot_id:
                 st.session_state["_pending_snapshot_id"] = resolved_meta.snapshot_id
                 snapshot_id = resolved_meta.snapshot_id
@@ -447,11 +985,15 @@ with st.chat_message("assistant"):
         "你好，我是量见。直接说出你的投资想法，我会追问缺失条件、整理策略草案，"
         "经你确认后完成回测、验证实验和报告。"
     )
-    st.caption("例如：用沪深300ETF测试双均线，5日线上穿20日线买入，回测近两年。")
+    st.caption(
+        "例如：用沪深300ETF测试双均线，5日线上穿20日线买入；"
+        "测试价格突破；或用14日 RSI，低于30买入、高于70卖出。"
+    )
 
-for message in st.session_state.setdefault("strategy_chat", []):
+for message_index, message in enumerate(st.session_state.setdefault("strategy_chat", [])):
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
+        _render_chat_evidence(message, message_index)
 
 
 draft: StrategyDraft | None = st.session_state.get("strategy_draft")
@@ -481,15 +1023,55 @@ if draft is not None:
                 "结束日期", min_value=pd.Timestamp(snapshot_meta.actual_start).date(),
                 max_value=pd.Timestamp(snapshot_meta.actual_end).date(), key=_DRAFT_WIDGET_KEYS["end"],
             )
-            param_col1, param_col2 = st.columns(2)
-            fast_value = int(param_col1.number_input(
-                "快线周期（日）", min_value=1, step=1, key=_DRAFT_WIDGET_KEYS["fast"],
-                help="较短时间的平均价格，对近期变化更敏感。",
-            ))
-            slow_value = int(param_col2.number_input(
-                "慢线周期（日）", min_value=2, step=1, key=_DRAFT_WIDGET_KEYS["slow"],
-                help="较长时间的平均价格，用来表示长期趋势。",
-            ))
+            st.markdown("**策略类型：" + {
+                "ma_cross": "双均线交叉",
+                "breakout": "价格通道突破",
+                "rsi_reversion": "RSI 均值回归",
+            }[draft.template] + "**")
+            fast_value, slow_value = draft.fast, draft.slow
+            entry_value, exit_value = draft.entry_window, draft.exit_window
+            rsi_period_value = draft.rsi_period
+            buy_threshold_value = draft.buy_threshold
+            sell_threshold_value = draft.sell_threshold
+            if draft.template == "ma_cross":
+                param_col1, param_col2 = st.columns(2)
+                fast_value = int(param_col1.number_input(
+                    "快线周期（日）", min_value=1, step=1, key=_DRAFT_WIDGET_KEYS["fast"],
+                    help="较短时间的平均价格，对近期变化更敏感。",
+                ))
+                slow_value = int(param_col2.number_input(
+                    "慢线周期（日）", min_value=2, step=1, key=_DRAFT_WIDGET_KEYS["slow"],
+                    help="较长时间的平均价格，用来表示长期趋势。",
+                ))
+            elif draft.template == "breakout":
+                param_col1, param_col2 = st.columns(2)
+                entry_value = int(param_col1.number_input(
+                    "突破周期（日）", min_value=2, step=1,
+                    key=_DRAFT_WIDGET_KEYS["entry_window"],
+                    help="收盘价超过此前这段时间的最高价时形成买入信号。",
+                ))
+                exit_value = int(param_col2.number_input(
+                    "退出周期（日）", min_value=1, step=1,
+                    key=_DRAFT_WIDGET_KEYS["exit_window"],
+                    help="收盘价低于此前这段时间的最低价时形成卖出信号。",
+                ))
+            else:
+                param_col1, param_col2, param_col3 = st.columns(3)
+                rsi_period_value = int(param_col1.number_input(
+                    "RSI 周期（日）", min_value=1, step=1,
+                    key=_DRAFT_WIDGET_KEYS["rsi_period"],
+                    help="计算近期上涨和下跌强弱时使用的交易日数。",
+                ))
+                buy_threshold_value = float(param_col2.number_input(
+                    "超卖买入阈值", min_value=1.0, max_value=99.0, step=1.0,
+                    key=_DRAFT_WIDGET_KEYS["buy_threshold"],
+                    help="RSI 不高于这个值时形成买入信号。",
+                ))
+                sell_threshold_value = float(param_col3.number_input(
+                    "超买卖出阈值", min_value=1.0, max_value=99.0, step=1.0,
+                    key=_DRAFT_WIDGET_KEYS["sell_threshold"],
+                    help="RSI 不低于这个值时形成卖出信号。",
+                ))
             st.markdown("**资金与交易成本**")
             cost_col1, cost_col2, cost_col3, cost_col4 = st.columns(4)
             cash_value = float(cost_col1.number_input(
@@ -517,6 +1099,11 @@ if draft is not None:
             end=end_value.isoformat(),
             fast=fast_value,
             slow=slow_value,
+            entry_window=entry_value,
+            exit_window=exit_value,
+            rsi_period=rsi_period_value,
+            buy_threshold=buy_threshold_value,
+            sell_threshold=sell_threshold_value,
             initial_cash=cash_value,
             commission_rate=commission_bps_value / 10_000,
             min_commission=min_commission_value,
@@ -535,10 +1122,23 @@ if draft is not None:
             available_start=available_start,
             available_end=available_end,
         )
-        st.write(
-            f"当 **{draft.fast} 日均线向上穿过 {draft.slow} 日均线** 时买入 "
-            f"**{_symbol_label(draft.symbol)}**；向下穿过时卖出。"
-        )
+        if draft.template == "ma_cross":
+            st.write(
+                f"当 **{draft.fast} 日均线向上穿过 {draft.slow} 日均线** 时买入 "
+                f"**{_symbol_label(draft.symbol)}**；向下穿过时卖出。"
+            )
+        elif draft.template == "breakout":
+            st.write(
+                f"当收盘价突破此前 **{draft.entry_window} 日最高价** 时买入 "
+                f"**{_symbol_label(draft.symbol)}**；跌破此前 "
+                f"**{draft.exit_window} 日最低价** 时卖出。"
+            )
+        else:
+            st.write(
+                f"计算 **{draft.rsi_period} 日 RSI**；当 RSI 不高于 "
+                f"**{draft.buy_threshold:g}** 时买入 **{_symbol_label(draft.symbol)}**，"
+                f"不低于 **{draft.sell_threshold:g}** 时卖出。"
+            )
         summary_cols = st.columns(3)
         summary_cols[0].markdown(f"**区间**  \n{draft.start} 至 {draft.end}")
         summary_cols[1].markdown(
@@ -599,6 +1199,7 @@ if draft is not None:
                     st.session_state["evidence_result"] = {
                         "key": result_key, "pack": pack, "analysis": analysis, "bundle": bundle,
                     }
+                    st.session_state["report_qa_history"] = []
                     status.update(label="验证和报告已经完成", state="complete", expanded=False)
                 mode = "AI 证据报告" if analysis["mode"] == "ai" else "事实报告"
                 completion = f"验证完成，已生成{mode}。图表、结论、证据和下载文件都在对话下方。"

@@ -73,12 +73,12 @@ class CostConfig:
 
 @dataclass
 class StrategyConfig:
-    template: Literal["ma_cross", "momentum_rotation"]
+    template: Literal["ma_cross", "breakout", "rsi_reversion", "momentum_rotation"]
     symbols: list[str]
     start: str
     end: str
     initial_cash: float = 100_000.0
-    params: dict = field(default_factory=dict)   # ma_cross: fast/slow；rotation: lookback/top_n/rebalance
+    params: dict = field(default_factory=dict)   # rsi_reversion: rsi_period/buy_threshold/sell_threshold
     cost: CostConfig = field(default_factory=CostConfig)
     snapshot_id: str | None = None
     assumptions: list[str] = field(default_factory=list)  # 默认假设，确认卡逐条展示

@@ -5,7 +5,7 @@ import pandas as pd
 
 from core.data import load_snapshot
 from core.schemas import Metrics, StrategyConfig
-from core.backtest.signals import run_ma_cross
+from core.backtest.signals import run_breakout, run_ma_cross, run_rsi_reversion
 from core.backtest.metrics import compute_metrics
 
 
@@ -37,6 +37,10 @@ def run_backtest(prices: pd.DataFrame, config: StrategyConfig,
 
     if config.template == "ma_cross":
         trades, daily = run_ma_cross(symbol_prices, config, period_benchmark)
+    elif config.template == "breakout":
+        trades, daily = run_breakout(symbol_prices, config, period_benchmark)
+    elif config.template == "rsi_reversion":
+        trades, daily = run_rsi_reversion(symbol_prices, config, period_benchmark)
     elif config.template == "momentum_rotation":
         raise NotImplementedError("动量轮动模板尚未实现")
     else:

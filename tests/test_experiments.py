@@ -81,6 +81,43 @@ def test_param_neighborhood_contains_baseline_and_valid_pairs(base_config):
     assert result.rule_satisfied == (result.pass_rate >= 0.70)
 
 
+def test_breakout_validation_suite_scans_breakout_parameters(base_config):
+    config = replace(
+        base_config,
+        template="breakout",
+        params={"entry_window": 20, "exit_window": 10},
+    )
+
+    report = run_validation_suite(config)
+
+    rows = report.experiments["strategy_parameter_robustness"].rows
+    pairs = {(row["entry_window"], row["exit_window"]) for row in rows}
+    assert (20, 10) in pairs
+    assert len(pairs) == 9
+    assert all(entry > exit_ for entry, exit_ in pairs)
+    assert all(row["error"] is None for row in rows)
+    assert sum(row["is_baseline"] for row in rows) == 1
+    assert report.context["config"]["template"] == "breakout"
+
+
+def test_rsi_validation_suite_scans_thresholds(base_config):
+    config = replace(
+        base_config,
+        template="rsi_reversion",
+        params={"rsi_period": 14, "buy_threshold": 30, "sell_threshold": 70},
+    )
+
+    report = run_validation_suite(config)
+
+    rows = report.experiments["strategy_parameter_robustness"].rows
+    pairs = {(row["buy_threshold"], row["sell_threshold"]) for row in rows}
+    assert (30, 70) in pairs
+    assert len(pairs) == 9
+    assert all(0 < buy < sell < 100 for buy, sell in pairs)
+    assert all(row["rsi_period"] == 14 and row["error"] is None for row in rows)
+    assert sum(row["is_baseline"] for row in rows) == 1
+
+
 def test_period_split_covers_two_non_overlapping_halves(base_config):
     resolved = resolve_experiment_spec(make_spec("period_split"), base_config)
     result = run_experiment(base_config, resolved)

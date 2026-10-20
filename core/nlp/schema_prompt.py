@@ -8,7 +8,9 @@ _SCHEMA_DESCRIPTION = """\
 只输出这一个 JSON object，不要输出任何其他文字、不要用代码块包裹。
 
 字段说明：
-- template: "ma_cross"（双均线）或 "momentum_rotation"（动量轮动）之一；无法判断则为 null。
+- template: "ma_cross"（双均线）、"breakout"（价格通道突破）、
+  "rsi_reversion"（RSI 超卖超买均值回归）或
+  "momentum_rotation"（动量轮动）之一；无法判断则为 null。
 - symbol_mentions: 用户原话里提到的标的名称/指代（字符串数组），如 ["沪深300"]。
 - symbols: 你从 symbol_mentions 对照下方资产池映射出的 6 位 ETF 代码数组；
   如果一个名称可能对应资产池中多个标的，不要猜，把这些候选全部写进 ambiguities，
@@ -16,6 +18,10 @@ _SCHEMA_DESCRIPTION = """\
 - start: 回测起始日期 "YYYY-MM-DD"，用户未提及则为 null。
 - end: 回测结束日期 "YYYY-MM-DD"，用户未提及则为 null。
 - params: 策略参数对象。ma_cross 用 {"fast": 整数, "slow": 整数}；
+  breakout 用 {"entry_window": 整数, "exit_window": 整数}，前者是向上突破的历史高点周期，
+  后者是向下突破的历史低点周期，且 entry_window 必须大于 exit_window；
+  rsi_reversion 用 {"rsi_period": 整数, "buy_threshold": 数字, "sell_threshold": 数字}，
+  阈值必须满足 0 < buy_threshold < sell_threshold < 100；
   momentum_rotation 用 {"lookback": 整数, "top_n": 整数, "rebalance": 字符串}。
   用户没提到的参数不要编造，缺的就不要放进这个对象里。
 - overrides: 用户明确提出的、与下方默认假设不同的执行细节，只在用户确实提及时才放进来，

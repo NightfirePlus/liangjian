@@ -1,7 +1,7 @@
 """策略模板：生成信号并模拟成交，产出逐笔交易表与逐日净值表。
 
 规则统一为"收盘出信号，次日开盘成交"：t 日收盘价算出的信号，在 t+1 日开盘价成交。
-当前只实现 ma_cross（双均线）；momentum_rotation 留空待补。
+当前实现 ma_cross（双均线）、breakout（价格通道突破）和 rsi_reversion（RSI 均值回归）。
 """
 from __future__ import annotations
 
@@ -24,9 +24,6 @@ def run_ma_cross(prices: pd.DataFrame, config: StrategyConfig,
         raise ValueError(f"均线参数必须为正整数: fast={fast}, slow={slow}")
     if fast >= slow:
         raise ValueError(f"快线周期必须小于慢线周期: fast={fast}, slow={slow}")
-    symbol = config.symbols[0]
-    cost = config.cost
-
     df = prices.sort_values("date").reset_index(drop=True).copy()
     df["ma_fast"] = df["close"].rolling(fast).mean()
     df["ma_slow"] = df["close"].rolling(slow).mean()
@@ -39,6 +36,92 @@ def run_ma_cross(prices: pd.DataFrame, config: StrategyConfig,
     df["signal"] = None
     df.loc[cross_up, "signal"] = "buy"
     df.loc[cross_down, "signal"] = "sell"
+
+    return _run_long_only_signals(
+        df, config, benchmark_prices,
+        buy_trigger=f"ma{fast}_cross_up_ma{slow}",
+        sell_trigger=f"ma{fast}_cross_down_ma{slow}",
+    )
+
+
+def run_breakout(
+    prices: pd.DataFrame,
+    config: StrategyConfig,
+    benchmark_prices: pd.DataFrame | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """价格通道突破：突破此前 entry 日最高价买入，跌破此前 exit 日最低价卖出。"""
+    entry = int(config.params.get("entry_window", 20))
+    exit_ = int(config.params.get("exit_window", 10))
+    if entry <= 0 or exit_ <= 0:
+        raise ValueError(f"突破和退出周期必须为正整数: entry_window={entry}, exit_window={exit_}")
+    if entry <= exit_:
+        raise ValueError(f"突破周期必须大于退出周期: entry_window={entry}, exit_window={exit_}")
+
+    df = prices.sort_values("date").reset_index(drop=True).copy()
+    df["entry_high"] = df["high"].rolling(entry).max().shift(1)
+    df["exit_low"] = df["low"].rolling(exit_).min().shift(1)
+    df["signal"] = None
+    df.loc[df["close"] > df["entry_high"], "signal"] = "buy"
+    df.loc[df["close"] < df["exit_low"], "signal"] = "sell"
+    return _run_long_only_signals(
+        df, config, benchmark_prices,
+        buy_trigger=f"close_breaks_{entry}d_high",
+        sell_trigger=f"close_breaks_{exit_}d_low",
+    )
+
+
+def run_rsi_reversion(
+    prices: pd.DataFrame,
+    config: StrategyConfig,
+    benchmark_prices: pd.DataFrame | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """RSI 均值回归：RSI 进入超卖阈值买入，进入超买阈值卖出。"""
+    period = int(config.params.get("rsi_period", 14))
+    buy_threshold = float(config.params.get("buy_threshold", 30))
+    sell_threshold = float(config.params.get("sell_threshold", 70))
+    if period <= 0:
+        raise ValueError(f"RSI 周期必须为正整数: rsi_period={period}")
+    if not 0 < buy_threshold < sell_threshold < 100:
+        raise ValueError(
+            "RSI 阈值必须满足 0 < 买入阈值 < 卖出阈值 < 100: "
+            f"buy_threshold={buy_threshold}, sell_threshold={sell_threshold}"
+        )
+
+    df = prices.sort_values("date").reset_index(drop=True).copy()
+    delta = df["close"].diff()
+    gains = delta.clip(lower=0)
+    losses = -delta.clip(upper=0)
+    average_gain = gains.ewm(
+        alpha=1 / period, adjust=False, min_periods=period
+    ).mean()
+    average_loss = losses.ewm(
+        alpha=1 / period, adjust=False, min_periods=period
+    ).mean()
+    relative_strength = average_gain / average_loss
+    df["rsi"] = 100 - (100 / (1 + relative_strength))
+    df.loc[(average_loss == 0) & (average_gain > 0), "rsi"] = 100.0
+
+    df["signal"] = None
+    df.loc[df["rsi"] <= buy_threshold, "signal"] = "buy"
+    df.loc[df["rsi"] >= sell_threshold, "signal"] = "sell"
+    return _run_long_only_signals(
+        df, config, benchmark_prices,
+        buy_trigger=f"rsi{period}_at_or_below_{buy_threshold:g}",
+        sell_trigger=f"rsi{period}_at_or_above_{sell_threshold:g}",
+    )
+
+
+def _run_long_only_signals(
+    df: pd.DataFrame,
+    config: StrategyConfig,
+    benchmark_prices: pd.DataFrame | None,
+    *,
+    buy_trigger: str,
+    sell_trigger: str,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """按统一的次日开盘、单标的满仓规则执行已生成的 buy/sell 信号。"""
+    symbol = config.symbols[0]
+    cost = config.cost
 
     bench = None
     if benchmark_prices is not None and not benchmark_prices.empty:
@@ -75,7 +158,7 @@ def run_ma_cross(prices: pd.DataFrame, config: StrategyConfig,
                         "trade_id": trade_id, "signal_date": signal_row["date"], "exec_date": date,
                         "symbol": symbol, "side": "buy", "shares": shares, "price": exec_price,
                         "gross": shares * exec_price, "commission": commission,
-                        "slippage_cost": slippage_cost, "rule_trigger": f"ma{fast}_cross_up_ma{slow}",
+                        "slippage_cost": slippage_cost, "rule_trigger": buy_trigger,
                     })
             elif pending_signal == "sell" and position_open:
                 exec_price = row["open"]
@@ -87,7 +170,7 @@ def run_ma_cross(prices: pd.DataFrame, config: StrategyConfig,
                     "trade_id": trade_id, "signal_date": signal_row["date"], "exec_date": date,
                     "symbol": symbol, "side": "sell", "shares": shares, "price": exec_price,
                     "gross": gross, "commission": commission,
-                    "slippage_cost": slippage_cost, "rule_trigger": f"ma{fast}_cross_down_ma{slow}",
+                    "slippage_cost": slippage_cost, "rule_trigger": sell_trigger,
                 })
                 shares = 0.0
                 position_open = False

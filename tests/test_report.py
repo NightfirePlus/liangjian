@@ -5,9 +5,12 @@ from zipfile import ZipFile
 import pytest
 
 from core.schemas import ExperimentResult, ValidationReport
-from core.report import build_evidence, chart_for, generate_report, export_bundle
+from core.report import (
+    answer_report_question, build_evidence, chart_for, export_bundle, generate_report,
+)
 from core.report.analysis import fact_report, validate_findings
 from core.report.evidence import EvidenceTools, dumps
+from core.report.qa import format_report_answer, validate_report_answer
 from core.nlp.llm_client import LLMError
 
 
@@ -59,6 +62,48 @@ def test_charts_preserve_negative_and_missing(pack):
     assert len(chart_for(pack, "run_abc:chart:periods").data) == 3
     assert pack["entries"]["run_abc:table:roundtrips"]["data"][0]["net_pnl"] == -14
     assert chart_for(pack, "run_abc:chart:drawdown").data[0].y[1] == pytest.approx(-.1)
+
+
+def test_breakout_parameter_heatmap_and_cell_tool(pack):
+    breakout_pack = deepcopy(pack)
+    table = breakout_pack["entries"]["run_abc:table:parameters"]
+    table["data"] = [
+        {"entry_window": 15, "exit_window": 8, "excess_return": .03,
+         "total_return": .04, "is_baseline": False},
+        {"entry_window": 20, "exit_window": 10, "excess_return": -.01,
+         "total_return": -.02, "is_baseline": True},
+    ]
+
+    heatmap = chart_for(breakout_pack, "run_abc:chart:parameters")
+    cell = EvidenceTools(breakout_pack).call(
+        "get_breakout_parameter_cell",
+        {"entry_window": 20, "exit_window": 10},
+    )
+
+    assert heatmap.layout.xaxis.title.text == "退出周期（日）"
+    assert heatmap.layout.yaxis.title.text == "突破周期（日）"
+    assert cell["rows"][0]["excess_return"] == -.01
+
+
+def test_rsi_parameter_heatmap_and_cell_tool(pack):
+    rsi_pack = deepcopy(pack)
+    table = rsi_pack["entries"]["run_abc:table:parameters"]
+    table["data"] = [
+        {"rsi_period": 14, "buy_threshold": 25.0, "sell_threshold": 65.0,
+         "excess_return": .02, "total_return": .03, "is_baseline": False},
+        {"rsi_period": 14, "buy_threshold": 30.0, "sell_threshold": 70.0,
+         "excess_return": -.01, "total_return": -.02, "is_baseline": True},
+    ]
+
+    heatmap = chart_for(rsi_pack, "run_abc:chart:parameters")
+    cell = EvidenceTools(rsi_pack).call(
+        "get_rsi_parameter_cell",
+        {"rsi_period": 14, "buy_threshold": 30.0, "sell_threshold": 70.0},
+    )
+
+    assert heatmap.layout.xaxis.title.text == "超买卖出阈值"
+    assert heatmap.layout.yaxis.title.text == "超卖买入阈值"
+    assert cell["rows"][0]["excess_return"] == -.01
 
 
 @pytest.mark.parametrize("mutation", ["reference", "path", "number", "dimension"])
@@ -138,3 +183,111 @@ def test_no_data_report_does_not_claim_support(pack):
     missing["entries"]["run_abc:baseline"]["data"] = {"error": "no prices"}
     report = generate_report(missing)
     assert "未获得" in report["findings"][0]["statement"]
+
+
+def test_report_answer_requires_bound_values_and_valid_evidence(pack):
+    candidate = {
+        "level": "diagnosis",
+        "answer_template": "原始策略的超额收益为{v0}，只能描述本次历史区间。",
+        "values": {
+            "v0": {
+                "evidence_id": "run_abc:baseline",
+                "path": ["excess_return"],
+                "format": "percent",
+            },
+        },
+        "evidence_refs": ["run_abc:baseline"],
+        "limitations": ["尚未进行样本外验证。"],
+    }
+
+    answer = validate_report_answer(candidate, pack)
+
+    assert "-1.00%" in answer["answer"]
+    bad = deepcopy(candidate)
+    bad["answer_template"] = "原始策略收益高达99%。"
+    bad["values"] = {}
+    with pytest.raises(ValueError):
+        validate_report_answer(bad, pack)
+
+    unsupported_dimension = deepcopy(candidate)
+    unsupported_dimension["answer_template"] += " 参数实验也表现稳定。"
+    with pytest.raises(ValueError, match="parameters"):
+        validate_report_answer(unsupported_dimension, pack)
+
+    with pytest.raises(ValueError, match="原因类问题"):
+        validate_report_answer(candidate, pack, question="为什么回撤这么大？")
+
+
+def test_report_question_tool_roundtrip_and_evidence_attachment(pack):
+    report = generate_report(pack)
+    answers = iter([
+        {"tool_calls": [{
+            "name": "get_evidence",
+            "arguments": {"evidence_id": "run_abc:table:daily"},
+        }]},
+        {
+            "level": "diagnosis",
+            "answer_template": "本次回撤需要结合逐日净值检查，现有证据只覆盖已测区间。",
+            "values": {},
+            "evidence_refs": ["run_abc:baseline", "run_abc:table:daily"],
+            "limitations": ["没有事件数据，不能归因于新闻或政策。"],
+        },
+    ])
+    seen = []
+
+    def complete(_system, user):
+        seen.append(user)
+        return next(answers)
+
+    answer = answer_report_question(
+        "为什么回撤这么大？", pack, report,
+        answer_mode="技术细节", complete=complete,
+    )
+    rendered = format_report_answer(answer, pack)
+
+    assert answer["mode"] == "ai"
+    assert len(answer["tool_log"]) == 1
+    assert "原始策略逐日净值" in rendered
+    assert "run_abc:table:daily" in rendered
+    assert '"answer_mode": "技术细节"' in seen[0]
+
+
+def test_report_question_retries_after_invalid_numbers(pack):
+    report = generate_report(pack)
+    answers = iter([
+        {
+            "level": "diagnosis",
+            "answer_template": "收益高达99%。",
+            "values": {},
+            "evidence_refs": ["run_abc:baseline"],
+            "limitations": [],
+        },
+        {
+            "level": "fact",
+            "answer_template": "原始策略的超额收益为{v0}。",
+            "values": {"v0": {
+                "evidence_id": "run_abc:baseline",
+                "path": ["excess_return"],
+                "format": "percent",
+            }},
+            "evidence_refs": ["run_abc:baseline"],
+            "limitations": ["仅适用于本次历史区间。"],
+        },
+    ])
+
+    answer = answer_report_question(
+        "表现如何？", pack, report, complete=lambda *_args: next(answers),
+    )
+
+    assert answer["mode"] == "ai"
+    assert answer["validation_retries"] == 1
+    assert answer["answer"] == "原始策略的超额收益为-1.00%。"
+
+
+def test_report_question_falls_back_without_llm(pack):
+    report = generate_report(pack)
+    answer = answer_report_question("成本影响大吗？", pack, report, use_llm=False)
+
+    assert answer["mode"] == "facts"
+    assert "滑点" in answer["answer"]
+    assert answer["evidence_refs"]

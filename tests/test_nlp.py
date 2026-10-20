@@ -56,6 +56,40 @@ def test_validate_fast_slow_order():
     assert any("快线" in i.message for i in result.issues)
 
 
+def test_validate_breakout_parameters():
+    valid = validate_candidate({
+        "template": "breakout", "symbols": ["510300"], "ambiguities": [],
+        "params": {"entry_window": 20, "exit_window": 10},
+        "start": "2023-01-01", "end": "2024-01-01", "missing": [],
+    })
+    invalid = validate_candidate({
+        "template": "breakout", "symbols": ["510300"], "ambiguities": [],
+        "params": {"entry_window": 10, "exit_window": 20},
+        "start": "2023-01-01", "end": "2024-01-01", "missing": [],
+    })
+
+    assert valid.ok
+    assert not invalid.ok
+    assert any("突破周期" in issue.message for issue in invalid.issues)
+
+
+def test_validate_rsi_parameters():
+    valid = validate_candidate({
+        "template": "rsi_reversion", "symbols": ["510300"], "ambiguities": [],
+        "params": {"rsi_period": 14, "buy_threshold": 30, "sell_threshold": 70},
+        "start": "2023-01-01", "end": "2024-01-01", "missing": [],
+    })
+    invalid = validate_candidate({
+        "template": "rsi_reversion", "symbols": ["510300"], "ambiguities": [],
+        "params": {"rsi_period": 14, "buy_threshold": 80, "sell_threshold": 20},
+        "start": "2023-01-01", "end": "2024-01-01", "missing": [],
+    })
+
+    assert valid.ok
+    assert not invalid.ok
+    assert any("RSI 阈值" in issue.message for issue in invalid.issues)
+
+
 def test_validate_period_order():
     result = validate_candidate({
         "template": "ma_cross", "symbols": ["510300"], "ambiguities": [],
@@ -161,6 +195,28 @@ def test_rule_fallback_uses_latest_multi_turn_changes():
     assert candidate["params"] == {"fast": 10, "slow": 30}
     assert candidate["start"] == "2022-01-01"
     assert candidate["end"] == "2025-01-01"
+
+
+def test_rule_fallback_parses_breakout_strategy():
+    candidate = parse_with_rules(
+        "510300价格通道突破，收盘突破过去20日最高价买入，"
+        "跌破过去10日最低价卖出，2023-01-01到2024-01-01"
+    )
+
+    assert candidate["template"] == "breakout"
+    assert candidate["params"] == {"entry_window": 20, "exit_window": 10}
+
+
+def test_rule_fallback_parses_rsi_strategy():
+    candidate = parse_with_rules(
+        "510300使用14日RSI，低于30买入，高于70卖出，"
+        "2023-01-01到2024-01-01"
+    )
+
+    assert candidate["template"] == "rsi_reversion"
+    assert candidate["params"] == {
+        "rsi_period": 14, "buy_threshold": 30.0, "sell_threshold": 70.0,
+    }
 
 
 # ---------------------------------------------------------------- parser: 端到端
