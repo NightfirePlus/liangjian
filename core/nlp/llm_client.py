@@ -18,18 +18,30 @@ class LLMError(Exception):
     """大模型调用失败或返回内容不是合法 JSON，统一包成这个异常供上层捕获降级。"""
 
 
-def complete_json(system_prompt: str, user_prompt: str, *, model: str | None = None) -> dict:
+def complete_json(
+    system_prompt: str,
+    user_prompt: str,
+    *,
+    model: str | None = None,
+    api_key: str | None = None,
+    base_url: str | None = None,
+) -> dict:
     """调用大模型，要求其只返回一个 JSON object，解析后以 dict 形式返回。
 
     失败（网络错误、HTTP 非 2xx、返回内容无法解析为 JSON）统一抛 LLMError。
     """
-    url = LLM_BASE_URL.rstrip("/") + "/chat/completions"
+    effective_key = LLM_API_KEY if api_key is None else api_key
+    effective_base_url = LLM_BASE_URL if base_url is None else base_url
+    effective_model = model or LLM_MODEL
+    if not effective_key or not effective_base_url or not effective_model:
+        raise LLMError("大模型配置不完整，请填写 API Key、接口 URL 和模型名")
+    url = effective_base_url.rstrip("/") + "/chat/completions"
     headers = {
-        "Authorization": f"Bearer {LLM_API_KEY}",
+        "Authorization": f"Bearer {effective_key}",
         "Content-Type": "application/json",
     }
     payload = {
-        "model": model or LLM_MODEL,
+        "model": effective_model,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},

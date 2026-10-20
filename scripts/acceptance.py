@@ -34,6 +34,24 @@ def run(snapshot_id: str, output: Path) -> dict:
     ):
         app = AppTest.from_file(str(ROOT / "app.py"), default_timeout=90).run()
         assert not app.exception, [e.value for e in app.exception]
+        llm_fields = {field.label for field in app.text_input}
+        assert {
+            "API Key", "OpenAI 兼容接口 URL", "解析与问答模型", "报告模型（可选）",
+        }.issubset(llm_fields)
+        fields = {field.label: field for field in app.text_input}
+        fields["API Key"].set_value("session-test-key")
+        fields["OpenAI 兼容接口 URL"].set_value("https://example.test/v1")
+        fields["解析与问答模型"].set_value("test-model")
+        fields["报告模型（可选）"].set_value("test-report-model")
+        next(b for b in app.button if b.label == "保存").click().run()
+        assert app.session_state["runtime_llm_config"] == {
+            "api_key": "session-test-key",
+            "base_url": "https://example.test/v1",
+            "model": "test-model",
+            "report_model": "test-report-model",
+        }
+        next(b for b in app.button if b.label == "恢复服务器配置").click().run()
+        assert "runtime_llm_config" not in app.session_state
         next(b for b in app.button if b.label == "用双均线开始").click().run()
         assert app.session_state["main_nav"] == "量化策略验证"
         assert app.session_state["strategy_draft"].template == "ma_cross"

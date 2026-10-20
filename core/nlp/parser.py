@@ -31,13 +31,17 @@ def parse_user_input(
     history: list[dict] | None = None,
     *,
     reference_end: str | None = None,
+    use_llm: bool | None = None,
+    complete=None,
 ) -> ParseResult:
     """text 为用户本轮输入；history 为之前的追问往返（见 schema_prompt.build_user_prompt）。
 
     返回 ParseResult：needs_clarification=True 时等待用户补充信息，
     False 时 strategy_config 已经可以直接送入 core/backtest。
     """
-    candidate, degraded, degraded_reason = _get_candidate(text, history)
+    candidate, degraded, degraded_reason = _get_candidate(
+        text, history, use_llm=use_llm, complete=complete,
+    )
     candidate = _resolve_relative_period(candidate, text, reference_end)
 
     validation = validate_candidate(candidate)
@@ -118,20 +122,28 @@ def _chinese_integer(value: str) -> int | None:
     return digits.get(value)
 
 
-def _get_candidate(text: str, history: list[dict] | None) -> tuple[dict, bool, str]:
+def _get_candidate(
+    text: str,
+    history: list[dict] | None,
+    *,
+    use_llm: bool | None = None,
+    complete=None,
+) -> tuple[dict, bool, str]:
     """返回 (候选字典, 是否降级, 降级原因)。"""
-    if not LLM_AVAILABLE:
+    enabled = LLM_AVAILABLE if use_llm is None else use_llm
+    if not enabled:
         return parse_with_rules(text), True, "当前未配置大模型 API，仅做了最基础的关键词识别"
 
+    client = complete or complete_json
     try:
         system_prompt = build_system_prompt()
         user_prompt = build_user_prompt(text, history)
-        return complete_json(system_prompt, user_prompt), False, ""
+        return client(system_prompt, user_prompt), False, ""
     except LLMError:
         try:
             system_prompt = build_system_prompt()
             user_prompt = build_user_prompt(text, history)
-            return complete_json(system_prompt, user_prompt), False, ""
+            return client(system_prompt, user_prompt), False, ""
         except LLMError as err:
             return parse_with_rules(text), True, f"大模型解析暂时不可用（{err}），仅做了最基础的关键词识别"
 

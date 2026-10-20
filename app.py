@@ -8,13 +8,15 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from config import APP_NAME, APP_TAGLINE, APP_VERSION, DISCLAIMER, LLM_AVAILABLE
+import config
+from config import APP_NAME, APP_TAGLINE, APP_VERSION, DISCLAIMER
 from core.agent import route_agent_message
 from core.backtest.engine import run_backtest_from_snapshot
 from core.data import ensure_market_snapshot, get_etf, list_snapshots, load_snapshot
 from core.experiments import run_validation_suite
 from core.finance import answer_finance_question
 from core.nlp import parse_user_input
+from core.nlp.llm_client import LLMError, complete_json
 from core.report import (
     answer_report_question, build_evidence, chart_for, export_bundle,
     format_report_answer, generate_report,
@@ -347,6 +349,139 @@ def _sidebar_cards(
     return current
 
 
+def _effective_llm_settings() -> dict:
+    saved = st.session_state.get("runtime_llm_config") or {}
+    environment = {
+        "api_key": config.LLM_API_KEY,
+        "base_url": config.LLM_BASE_URL,
+        "model": config.LLM_MODEL,
+        "report_model": config.LLM_REPORT_MODEL or config.LLM_MODEL,
+    } if config.LLM_AVAILABLE else {
+        "api_key": "", "base_url": "", "model": "", "report_model": "",
+    }
+    return {
+        "api_key": saved.get("api_key") or environment["api_key"],
+        "base_url": saved.get("base_url") or environment["base_url"],
+        "model": saved.get("model") or environment["model"],
+        "report_model": (
+            saved.get("report_model") or saved.get("model")
+            or environment["report_model"] or environment["model"]
+        ),
+        "source": "session" if saved else ("environment" if config.LLM_AVAILABLE else "none"),
+    }
+
+
+def _llm_complete(settings: dict, *, report: bool = False):
+    model = settings["report_model"] if report else settings["model"]
+
+    def complete(system_prompt: str, user_prompt: str) -> dict:
+        return complete_json(
+            system_prompt,
+            user_prompt,
+            model=model,
+            api_key=settings["api_key"],
+            base_url=settings["base_url"],
+        )
+
+    return complete
+
+
+def _clear_runtime_llm_config() -> None:
+    st.session_state.pop("runtime_llm_config", None)
+    for key in (
+        "llm_api_key_input", "llm_base_url_input",
+        "llm_model_input", "llm_report_model_input",
+    ):
+        st.session_state.pop(key, None)
+    st.session_state["llm_connection_notice"] = (
+        "info", "已恢复服务器默认配置。" if config.LLM_AVAILABLE else "已清除当前会话配置。"
+    )
+
+
+def _render_llm_connection() -> dict:
+    """渲染会话级模型配置；API Key 不写文件、不进入报告和下载包。"""
+    current = _effective_llm_settings()
+    with st.sidebar.expander("模型连接", expanded=current["source"] == "none"):
+        source_label = {
+            "session": "当前会话配置",
+            "environment": "服务器环境配置",
+            "none": "尚未配置",
+        }[current["source"]]
+        st.caption(f"状态：{source_label}")
+        with st.form("llm_connection_form"):
+            key_input = st.text_input(
+                "API Key",
+                value=(st.session_state.get("runtime_llm_config") or {}).get("api_key", ""),
+                key="llm_api_key_input",
+                type="password",
+                placeholder="sk-…",
+                help="只保存在当前 Streamlit 会话中，不写入 .env 或仓库。",
+            )
+            url_input = st.text_input(
+                "OpenAI 兼容接口 URL",
+                value=current["base_url"],
+                key="llm_base_url_input",
+                placeholder="https://…/compatible-mode/v1",
+            )
+            model_input = st.text_input(
+                "解析与问答模型",
+                value=current["model"],
+                key="llm_model_input",
+                placeholder="例如 qwen-plus",
+            )
+            report_model_input = st.text_input(
+                "报告模型（可选）",
+                value=current["report_model"],
+                key="llm_report_model_input",
+                placeholder="留空则使用上面的模型",
+            )
+            save_col, test_col = st.columns(2)
+            save_clicked = save_col.form_submit_button("保存", use_container_width=True)
+            test_clicked = test_col.form_submit_button("测试并保存", use_container_width=True)
+
+        if save_clicked or test_clicked:
+            candidate = {
+                "api_key": key_input.strip() or config.LLM_API_KEY,
+                "base_url": url_input.strip(),
+                "model": model_input.strip(),
+                "report_model": report_model_input.strip() or model_input.strip(),
+            }
+            if not all((candidate["api_key"], candidate["base_url"], candidate["model"])):
+                st.session_state["llm_connection_notice"] = (
+                    "error", "请完整填写 API Key、接口 URL 和模型名。"
+                )
+            elif test_clicked:
+                try:
+                    response = complete_json(
+                        "只输出 JSON 对象，不要输出其他文字。",
+                        '请返回 {"ok": true}。',
+                        model=candidate["model"],
+                        api_key=candidate["api_key"],
+                        base_url=candidate["base_url"],
+                    )
+                    if response.get("ok") is not True:
+                        raise LLMError("模型返回了响应，但没有按测试格式返回")
+                    st.session_state["runtime_llm_config"] = candidate
+                    st.session_state["llm_connection_notice"] = ("success", "连接成功，配置已用于当前会话。")
+                except LLMError as error:
+                    st.session_state["llm_connection_notice"] = ("error", f"连接失败：{error}")
+            else:
+                st.session_state["runtime_llm_config"] = candidate
+                st.session_state["llm_connection_notice"] = ("success", "配置已保存到当前会话。")
+            st.rerun()
+
+        notice = st.session_state.get("llm_connection_notice")
+        if notice:
+            getattr(st, notice[0])(notice[1])
+        if current["source"] == "session":
+            st.button(
+                "恢复服务器配置", key="clear_runtime_llm", use_container_width=True,
+                on_click=_clear_runtime_llm_config,
+            )
+        st.caption("Key 不会写入项目文件；刷新或会话过期后可能需要重新填写。")
+    return _effective_llm_settings()
+
+
 def _seed_verification(template: str) -> None:
     st.session_state["verification_seed_template"] = template
     st.session_state["main_nav"] = "量化策略验证"
@@ -522,6 +657,14 @@ def _render_docs() -> None:
         )
         st.error("正收益比例不是未来成功概率；历史表现、参数邻域和分时段实验都不构成统计证明。")
     with ai_tab:
+        st.markdown("### 模型连接")
+        st.write("在任意页面展开侧栏的“模型连接”，填写 API Key、OpenAI 兼容接口 URL 和模型名。报告模型可以单独填写；留空时使用同一个模型。")
+        st.markdown(
+            "- **保存**：立即用于自然语言解析、金融问答、报告生成和报告追问，不额外发起测试请求。\n"
+            "- **测试并保存**：先发送一个最小 JSON 请求，连接成功后再启用。\n"
+            "- **会话范围**：配置只存在当前浏览器会话中，不写入 `.env`、仓库、报告或下载文件。"
+        )
+        st.caption("如果部署者已经通过环境变量配置模型，侧栏会显示“服务器环境配置”；用户填写的会话配置优先。")
         st.markdown("### 回答方式")
         st.write("侧栏可以随时切换，设置会用于 AI 金融问答；实验事实和证据不会随表达方式变化。")
         st.dataframe(pd.DataFrame([
@@ -532,11 +675,11 @@ def _render_docs() -> None:
         st.info("AI 金融问答目前只讲基础概念和常见策略，不查询实时价格或新闻，也不提供个性化投资建议。")
 
 
-def _render_finance_qa(answer_mode: str) -> None:
+def _render_finance_qa(answer_mode: str, *, llm_available: bool, llm_complete) -> None:
     st.markdown("<div class='qv-eyebrow'>LEARN</div>", unsafe_allow_html=True)
     st.title("AI 金融问答")
     st.caption("先理解概念，再决定是否把一个受支持的策略带入历史验证。")
-    if not LLM_AVAILABLE:
+    if not llm_available:
         st.info("模型尚未配置，当前使用本地基础知识回答常见概念。")
 
     st.markdown("### 可以这样问")
@@ -560,7 +703,8 @@ def _render_finance_qa(answer_mode: str) -> None:
         history.append({"role": "user", "content": question})
         with st.spinner("正在整理这个概念……"):
             answer = answer_finance_question(
-                question, mode=answer_mode, history=history, use_llm=LLM_AVAILABLE,
+                question, mode=answer_mode, history=history,
+                use_llm=llm_available, complete=llm_complete,
             )
         history.append({"role": "assistant", **answer})
         st.rerun()
@@ -604,6 +748,13 @@ answer_mode = _sidebar_cards(
     icons=("○", "◇", "□"),
 )
 st.sidebar.caption("回答方式不会修改回测结果。")
+st.sidebar.divider()
+llm_settings = _render_llm_connection()
+llm_available = bool(
+    llm_settings["api_key"] and llm_settings["base_url"] and llm_settings["model"]
+)
+llm_complete = _llm_complete(llm_settings)
+llm_report_complete = _llm_complete(llm_settings, report=True)
 
 if page == "首页":
     _render_home()
@@ -614,7 +765,9 @@ if page == "使用文档":
     st.caption(DISCLAIMER)
     st.stop()
 if page == "AI 金融问答":
-    _render_finance_qa(answer_mode)
+    _render_finance_qa(
+        answer_mode, llm_available=llm_available, llm_complete=llm_complete,
+    )
     st.stop()
 
 
@@ -869,7 +1022,8 @@ if idea_text and idea_text.strip():
         with st.spinner("正在查阅本次实验的指标、图表和证据……"):
             answer = answer_report_question(
                 idea_text.strip(), pack, report,
-                history=history, answer_mode=answer_mode, use_llm=LLM_AVAILABLE,
+                history=history, answer_mode=answer_mode,
+                use_llm=llm_available, complete=llm_report_complete,
             )
         history.append({
             "question": idea_text.strip(),
@@ -886,7 +1040,12 @@ if idea_text and idea_text.strip():
     strategy_inputs.append(idea_text.strip())
     combined_text = "\n".join(strategy_inputs)
     with st.spinner("正在理解你的想法……"):
-        parsed = parse_user_input(combined_text, reference_end=date.today().isoformat())
+        parsed = parse_user_input(
+            combined_text,
+            reference_end=date.today().isoformat(),
+            use_llm=llm_available,
+            complete=llm_complete,
+        )
     if parsed.needs_clarification:
         reply = "还需要你补充：\n\n" + "\n".join(f"- {question}" for question in parsed.questions)
         if parsed.degraded:
@@ -977,8 +1136,8 @@ if snapshot_meta.is_synthetic:
     st.warning("当前使用模拟数据，只能验证系统流程，不能用于判断策略有效性。")
 if quality_report.has_error:
     st.error("当前行情存在错误级质量问题，请在侧栏更换数据。")
-if not LLM_AVAILABLE:
-    st.info("模型尚未配置，Agent 将使用基础规则理解想法，并生成程序事实报告。")
+if not llm_available:
+    st.info("模型尚未配置。请在侧栏“模型连接”中填写配置；未配置时 Agent 会使用基础规则和程序事实报告。")
 
 with st.chat_message("assistant"):
     st.write(
@@ -1171,30 +1330,34 @@ if draft is not None:
         )
         result_key = draft_hash
         if run_clicked:
-            config = draft.to_config(snapshot_id)
+            execution_config = draft.to_config(snapshot_id)
             benchmark_symbol = draft.benchmark_symbol or draft.symbol
             try:
                 with st.status("Agent 正在验证策略……", expanded=True) as status:
                     st.write("正在读取固定行情快照并运行原始策略回测……")
                     trades, daily, metrics = run_backtest_from_snapshot(
-                        config, benchmark_symbol=draft.benchmark_symbol,
+                        execution_config, benchmark_symbol=draft.benchmark_symbol,
                     )
                     st.session_state["backtest_result"] = {
-                        "key": result_key, "config": config, "trades": trades,
+                        "key": result_key, "config": execution_config, "trades": trades,
                         "daily": daily, "metrics": metrics,
                     }
                     st.write("正在测试交易成本、邻近参数和不同时段……")
-                    validation_report = run_validation_suite(config, benchmark_symbol=benchmark_symbol)
+                    validation_report = run_validation_suite(
+                        execution_config, benchmark_symbol=benchmark_symbol,
+                    )
                     st.session_state["validation_result"] = {
                         "key": result_key, "report": validation_report,
                     }
                     st.write("正在整理热力图、对比图和可追溯证据……")
                     pack = build_evidence(validation_report)
-                    if LLM_AVAILABLE:
+                    if llm_available:
                         st.write("正在让 AI 阅读结构化实验数据并撰写结论……")
                     else:
                         st.write("模型未配置，正在生成程序事实摘要……")
-                    analysis = generate_report(pack, use_llm=LLM_AVAILABLE)
+                    analysis = generate_report(
+                        pack, use_llm=llm_available, complete=llm_report_complete,
+                    )
                     bundle = export_bundle(pack, analysis)
                     st.session_state["evidence_result"] = {
                         "key": result_key, "pack": pack, "analysis": analysis, "bundle": bundle,
